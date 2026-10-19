@@ -92,6 +92,20 @@ describe('Router decisions', () => {
     assert.equal(callCount, 0);
   });
 
+  it('a Gemini turn that fell back to Claude makes no fake transition on the next turn', async () => {
+    const dist: any = { simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 };
+    const { router, store } = setupRouter(dist);
+    store.set('s15:main', 'primary');
+    const turn = { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'hi' }] };
+    const toGemini = await router.decide(req(turn, { 'x-claude-code-session-id': 's15' }) as any);
+    assert.equal(toGemini.route, 'gemini');
+    router.clearGeminiLoop(toGemini, 'primary'); // Gemini failed: Claude served it
+    dist.textOnly = 0.1;
+    const next = await router.decide(req(turn, { 'x-claude-code-session-id': 's15' }) as any);
+    assert.equal(next.route, 'primary');
+    assert.equal(next.modelTransition, undefined);
+  });
+
   it('stored primary + geminiFromPrimary true + classifier rejects', async () => {
     const { router, store } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.1 }, { geminiFromPrimary: true });
     store.set('s10:main', 'primary');

@@ -30,6 +30,7 @@ describe('Gemini Tier E2E', () => {
   let anthropic: Server;
   let anthropicUrl: string;
   let anthropicHits = 0;
+  let lastAnthropicBody: any;
   let dbDir: string;
   let telemetry: SqliteTelemetry;
   let telemetryDb: any; // Add telemetryDb
@@ -42,6 +43,7 @@ describe('Gemini Tier E2E', () => {
       const parts: Buffer[] = [];
       req.on('data', (c) => parts.push(c));
       req.on('end', () => {
+        lastAnthropicBody = JSON.parse(Buffer.concat(parts).toString('utf8') || 'null');
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'upstream ok' }], stop_reason: 'end_turn', usage: {} }));
       });
@@ -197,6 +199,48 @@ describe('Gemini Tier E2E', () => {
       assert.equal(anthropicHits, 1);
       const data = await body.json() as any;
       assert.equal(data.content[0].text, 'upstream ok');
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
+  it('failover gives Claude the untouched body and /route/:session reports why', async () => {
+    const { proxy, url } = await createTestServer({ GEMINI_TIER: 'on', GEMINI_TIER_FROM_PRIMARY: 'true' });
+    const geminiStdin: string[] = [];
+    const failing = () => {
+      const child = new EventEmitter() as any;
+      let input = '';
+      child.stdin = new Writable({ write(c, e, cb) { input += c.toString(); cb(); }, final(cb) { geminiStdin.push(input); cb(); } });
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 304;
+      setTimeout(() => child.emit('close', 1), 5);
+      return child;
+    };
+    spawnQueue.push(failing, failing);
+    // A cwd with no .ai-memory.toml: the handoff never touches the real ai-memory.
+    const system = `Working directory: ${dbDir}`;
+    const headers = { 'content-type': 'application/json', 'x-claude-code-session-id': 'e2e-route' };
+    const send = (messages: any[]) => request(`${url}/v1/messages`, { method: 'POST', headers, body: JSON.stringify({ model: 'claude', system, messages }) });
+    try {
+      const t1 = [{ role: 'user', content: 'hello' }];
+      await (await send(t1)).body.text(); // Gemini fails, Claude serves turn 1
+      const r2 = await send([...t1, { role: 'assistant', content: 'upstream ok' }, { role: 'user', content: 'and now?' }]);
+      assert.equal(r2.headers['x-jev-route'], 'primary; reason=failover:gemini-unavailable');
+      await r2.body.text();
+      assert.ok(geminiStdin.at(-1)?.includes('Model transition: primary -> gemini'), 'Gemini got the handoff');
+      assert.equal(lastAnthropicBody.system, system, 'Claude got the system prompt as sent');
+
+      const route = await request(`${url}/route/e2e-route`);
+      assert.equal(route.statusCode, 200);
+      const last = await route.body.json() as any;
+      assert.equal(last.route, 'primary');
+      assert.equal(last.reason, 'failover:gemini-unavailable');
+
+      const unknown = await request(`${url}/route/no-such-session`);
+      assert.equal(unknown.statusCode, 404);
+      await unknown.body.text();
     } finally {
       await proxy.close();
       telemetry.close();

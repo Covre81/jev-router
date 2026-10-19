@@ -35,8 +35,8 @@ describe('Gemini tier unit tests', () => {
       assert.ok(c.gemini);
       assert.equal(c.gemini.model, 'gemini-3.8-flash-high');
       assert.equal(c.gemini.timeoutMs, 60000);
-      assert.equal(c.gemini.minTextOnly, 0);
-      assert.equal(c.gemini.pressureMinTextOnly, 0);
+      assert.equal(c.gemini.minTextOnly, 0.8);
+      assert.equal(c.gemini.pressureMinTextOnly, 0.6);
       assert.equal(c.gemini.fromPrimary, true);
       assert.equal(c.gemini.maxConcurrency, 1);
       assert.equal(c.gemini.maxPromptChars, 200000);
