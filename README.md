@@ -277,7 +277,7 @@ Deliberately absent:
 ## Setup
 
 ```bash
-git clone https://github.com/Covre81/JEV-APP-PC.git jev-router && cd jev-router
+git clone https://github.com/Covre81/jev-router.git && cd jev-router
 npm ci
 cp .env.example .env
 #   TYPESAFE_API_KEY=...   (or CLASSIFIER=heuristic for offline dev)
