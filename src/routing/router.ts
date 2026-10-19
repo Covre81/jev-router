@@ -304,11 +304,16 @@ export class Router {
     }
   }
 
-  /** A Gemini turn fell back: clear its tool loop and record who served it, so the next turn is no fake transition. */
+  /**
+   * A Gemini turn fell back: clear its tool loop and record who served it, so the next turn is no fake
+   * transition. A conversation stored as gemini moves to that tier too, or its tool steps would try Gemini again.
+   */
   clearGeminiLoop(decision: RouteDecision, served: Tier): void {
-    if (decision.conversationKey) {
-      this.lastRouteWasGemini.delete(decision.conversationKey);
-      this.lastServedTier.set(decision.conversationKey, served);
+    const key = decision.conversationKey;
+    if (key) {
+      this.lastRouteWasGemini.delete(key);
+      this.lastServedTier.set(key, served);
+      if (this.sessions.get(key) === 'gemini') this.sessions.set(key, served);
     }
   }
 }
