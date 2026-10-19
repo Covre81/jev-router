@@ -106,6 +106,21 @@ describe('Router decisions', () => {
     assert.equal(next.modelTransition, undefined);
   });
 
+  it('the tool loop of a fresh turn Claude rescued from Gemini stays on Claude', async () => {
+    const { router, store } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 });
+    const sid = { 'x-claude-code-session-id': 's16' };
+    const first = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }] }, sid) as any);
+    assert.equal(first.route, 'gemini');
+    router.clearGeminiLoop(first, 'primary');
+    const toolStep = await router.decide(req({ messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: '1', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: '1', content: 'ok' }] },
+    ] }, sid) as any);
+    assert.equal(toolStep.route, 'primary');
+    assert.equal(store.get('s16:main'), 'primary');
+  });
+
   it('stored primary + geminiFromPrimary true + classifier rejects', async () => {
     const { router, store } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.1 }, { geminiFromPrimary: true });
     store.set('s10:main', 'primary');
