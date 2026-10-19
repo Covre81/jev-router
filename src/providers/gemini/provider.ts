@@ -5,6 +5,47 @@ import { runAgy, type AgyRunnerOptions, type SpawnAgy } from './agy-runner.js';
 import { renderGeminiPrompt } from './prompt.js';
 import { sseEvent } from '../openai/sse.js';
 
+export interface ParsedGeminiToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly input: Record<string, unknown>;
+}
+
+const JEV_TOOL_USE_RE = /<jev_tool_use>\s*([\s\S]*?)\s*<\/jev_tool_use>/g;
+
+export function parseGeminiToolCalls(rawText: string): {
+  text: string;
+  toolCalls: ParsedGeminiToolCall[];
+} {
+  const toolCalls: ParsedGeminiToolCall[] = [];
+  const cleaned = rawText.replace(JEV_TOOL_USE_RE, (fullMatch, inner: string) => {
+    const trimmed = inner.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && typeof parsed.name === 'string' && parsed.name.length > 0) {
+        const input =
+          parsed.input && typeof parsed.input === 'object' && !Array.isArray(parsed.input)
+            ? (parsed.input as Record<string, unknown>)
+            : {};
+        toolCalls.push({
+          id: `toolu_jev_${randomUUID().replace(/-/g, '').slice(0, 20)}`,
+          name: parsed.name,
+          input,
+        });
+        return '';
+      }
+    } catch {
+      // Leave malformed block as text rather than dropping it silently.
+    }
+    return fullMatch;
+  });
+
+  return {
+    text: cleaned.trim(),
+    toolCalls,
+  };
+}
+
 export class GeminiCliProvider implements Provider {
   readonly name = 'gemini-cli';
 
@@ -43,11 +84,13 @@ export class GeminiCliProvider implements Provider {
       return { kind: 'unavailable', reason: res.reason };
     }
 
-    const text = res.text.trim();
-    if (text.startsWith('JEV_NEEDS_TOOLS') || text === 'JEV_NEEDS_TOOLS') {
+    const rawText = res.text.trim();
+    const { text, toolCalls } = parseGeminiToolCalls(rawText);
+    if (toolCalls.length === 0 && (text.startsWith('JEV_NEEDS_TOOLS') || text === 'JEV_NEEDS_TOOLS')) {
       return { kind: 'unavailable', reason: 'model asked for tools' };
     }
 
+    const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
     const usage = res.usage;
     const msgId = `msg_jev_${randomUUID()}`;
 
@@ -73,23 +116,41 @@ export class GeminiCliProvider implements Provider {
           }
         });
 
-        yield sseEvent('content_block_start', {
-          index: 0,
-          content_block: { type: 'text', text: '' }
-        });
+        let index = 0;
 
-        const chunkLen = 2000;
-        for (let i = 0; i < text.length; i += chunkLen) {
-          yield sseEvent('content_block_delta', {
-            index: 0,
-            delta: { type: 'text_delta', text: text.slice(i, i + chunkLen) }
+        if (text.length > 0 || toolCalls.length === 0) {
+          yield sseEvent('content_block_start', {
+            index,
+            content_block: { type: 'text', text: '' }
           });
+
+          const chunkLen = 2000;
+          for (let i = 0; i < text.length; i += chunkLen) {
+            yield sseEvent('content_block_delta', {
+              index,
+              delta: { type: 'text_delta', text: text.slice(i, i + chunkLen) }
+            });
+          }
+
+          yield sseEvent('content_block_stop', { index });
+          index++;
         }
 
-        yield sseEvent('content_block_stop', { index: 0 });
+        for (const call of toolCalls) {
+          yield sseEvent('content_block_start', {
+            index,
+            content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} }
+          });
+          yield sseEvent('content_block_delta', {
+            index,
+            delta: { type: 'input_json_delta', partial_json: JSON.stringify(call.input) }
+          });
+          yield sseEvent('content_block_stop', { index });
+          index++;
+        }
 
         yield sseEvent('message_delta', {
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          delta: { stop_reason: stopReason, stop_sequence: null },
           usage: { output_tokens: usage.outputTokens }
         });
 
@@ -103,13 +164,26 @@ export class GeminiCliProvider implements Provider {
         body: Readable.from(generateStream())
       };
     } else {
+      const content: Array<Record<string, unknown>> = [];
+      if (text.length > 0 || toolCalls.length === 0) {
+        content.push({ type: 'text', text });
+      }
+      for (const call of toolCalls) {
+        content.push({
+          type: 'tool_use',
+          id: call.id,
+          name: call.name,
+          input: call.input,
+        });
+      }
+
       const responseJson = {
         id: msgId,
         type: 'message',
         role: 'assistant',
         model: this.opts.model,
-        content: [{ type: 'text', text: text }],
-        stop_reason: 'end_turn',
+        content,
+        stop_reason: stopReason,
         stop_sequence: null,
         usage: {
           input_tokens: res.usage.inputTokens,
@@ -126,3 +200,4 @@ export class GeminiCliProvider implements Provider {
     }
   }
 }
+

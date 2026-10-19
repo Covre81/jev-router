@@ -36,13 +36,29 @@ export interface PolicyOptions {
  * depth. We send work to the cheap provider only when the probability mass of
  * cheap-eligible levels clears the bar; everything else stays on the primary.
  */
-export function selectTier(d: ComplexityDistribution & { readonly risk?: number }, options: PolicyOptions): Tier {
-  if ((d.risk ?? 0) >= MAX_CHEAP_RISK) return 'primary';
-  if (d.simple >= options.minCheapProbability) return 'trivial';
+export interface RiskScoresSummary {
+  readonly security_sensitive: number;
+  readonly destructive_or_production: number;
+  readonly requires_inspection: number;
+}
+
+export function selectTier(
+  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
+  options: PolicyOptions,
+): Tier {
+  const hardRisk = d.riskScores
+    ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
+    : (d.risk ?? 0);
+  if (hardRisk >= MAX_CHEAP_RISK) return 'primary';
+
+  const inspectionVeto = (d.risk ?? 0) >= MAX_CHEAP_RISK;
+  if (!inspectionVeto && d.simple >= options.minCheapProbability) return 'trivial';
+
   const lowMass = d.simple + d.standard;
   if (options.standardEnabled) {
     return lowMass >= (options.minStandardProbability ?? 1) ? 'standard' : 'primary';
   }
+  if (inspectionVeto) return 'primary';
   return options.standardRoute === 'cheap' && lowMass >= options.minCheapProbability ? 'trivial' : 'primary';
 }
 
@@ -91,16 +107,21 @@ export interface GeminiPolicyOptions {
 }
 
 export function geminiEligible(
-  d: ComplexityDistribution & { readonly risk?: number; readonly textOnly?: number },
+  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary; readonly textOnly?: number },
   proposedTier: Tier,
   opts: GeminiPolicyOptions,
   quotaLevel: 'none' | 'pressure' | 'critical'
 ): boolean {
   if (!opts.enabled) return false;
   if (proposedTier !== 'primary') return false;
-  if ((d.risk ?? 0) >= MAX_CHEAP_RISK) return false;
-  if (d.textOnly === undefined) return false;
-  
+  const hardRisk = d.riskScores
+    ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
+    : (d.risk ?? 0);
+  if (hardRisk >= MAX_CHEAP_RISK) return false;
+
   const bar = quotaLevel !== 'none' ? Math.min(opts.minTextOnly, opts.pressureMinTextOnly) : opts.minTextOnly;
+  if (bar <= 0) return true;
+  if (d.textOnly === undefined) return false;
   return d.textOnly >= bar;
 }
+

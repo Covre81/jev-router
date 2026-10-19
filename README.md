@@ -137,16 +137,16 @@ When `CHEAP_READ_FIRST_HINT=true` (the default), if a session's first turn is a 
 
 The router can optionally divert medium-to-hard, text-only turns to Gemini using the user's Google subscription via the Antigravity CLI (`agy`) as a child process. This spares the Claude quota for work that needs it, without requiring a separate API key.
 
-- **Scope**: Text-only turns (explanations, design discussions, planning, conceptual Q&A, code reviews) that do not require tool use.
-- **Fail-open**: It is off by default and fails open to Claude (e.g. if the CLI is missing, times out, or the tier is busy).
-- **Latency**: ~6–7 s minimum per turn. The answer arrives all at once (simulated streaming). Real answers take ~25–30 s for a long explanation with gemini-3.1-pro-high (measured), so `GEMINI_TIER_TIMEOUT_MS` may need 90000 for long answers.
+- **Scope**: Text-only turns (explanations, design discussions, planning, conceptual Q&A, code reviews) that do not require tool use, evaluated after `gpt-oss:20b-cloud` (trivial) and `gemma4:31b-cloud` (standard) and before Claude (primary).
+- **Fail-open**: It is off by default and fails open to the session's fallback tier or Claude (e.g. if the CLI is missing, times out, or the tier is busy).
+- **Latency**: ~6–7 s minimum per turn. The answer arrives all at once (simulated streaming). Long explanations with `gemini-3.8-flash-high` can take ~15–25 s, so `GEMINI_TIER_TIMEOUT_MS` may need 90000 for long answers.
 - **API Keys**: The child process is started WITHOUT `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_PROJECT` (stripped from its environment), so agy always uses the Google account login (subscription) and never an API key.
 - **JEV Question**: Uses the `text_answer_suffices` question to determine if the turn can be fully answered with a written reply without running tools.
 - **Isolation and Safety**: The child process runs with a router-owned `agy` profile (`HOME`/`USERPROFILE`) containing explicit deny rules for all tools (`write_file(*)`, `command(*)`, etc.). The temporary working directory is removed immediately. If the model attempts any tool use, the child process is killed instantly and the turn falls back to Claude.
 
 **Configuration (Environment variables):**
 - `GEMINI_TIER=on` (default: `off`)
-- `GEMINI_TIER_MODEL=gemini-3.1-pro-high`
+- `GEMINI_TIER_MODEL=gemini-3.8-flash-high`
 - `GEMINI_TIER_BIN` (default: `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows, `agy` elsewhere)
 - `GEMINI_TIER_TIMEOUT_MS=60000`
 - `GEMINI_TIER_MIN_TEXT_ONLY=0.8` (min JEV confidence that a text answer suffices)

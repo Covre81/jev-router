@@ -97,8 +97,9 @@ async function probeHealth(url: string): Promise<Health | undefined> {
   }
 }
 
-/** Claude Code pipes the session as JSON on stdin; anything else (a TTY, garbage, silence) means no session. */
+/** Claude Code and Antigravity/agy pipe the session as JSON on stdin; anything else (a TTY, garbage, silence) means no session. */
 export async function readSessionId(stdin: NodeJS.ReadStream = process.stdin): Promise<string | undefined> {
-  const id = (await readHookInput(stdin, STDIN_TIMEOUT_MS))?.['session_id'];
+  const input = await readHookInput(stdin, STDIN_TIMEOUT_MS);
+  const id = input?.['session_id'] ?? input?.['conversationId'];
   return typeof id === 'string' && id.length > 0 ? id : undefined;
 }

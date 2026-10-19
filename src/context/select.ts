@@ -63,7 +63,7 @@ export async function scoreCandidates(options: {
 
         questions[cand.id] = {
           type: 'noul',
-          instructions: `${STAGE2_INSTRUCTIONS}\nPrompt: "${options.prompt}"\nContext Item:\n${itemDesc}`,
+          instructions: `${STAGE2_INSTRUCTIONS}\nContext Item:\n${itemDesc}`,
         };
       }
 

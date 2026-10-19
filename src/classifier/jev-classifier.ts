@@ -38,7 +38,7 @@ export const RISK_QUESTIONS = {
   requires_inspection: {
     type: 'noul',
     instructions:
-      "The request asks for a verdict or a report about the project's current state (whether things are ok, what changed, what is wrong, where things stand) that can only be given after investigating several files, diffs, git history or logs, and the request itself does not contain those facts (e.g. 'is everything ok here?', 'summarize what changed in the statusline'). A request to make a specific edit, run a named command, or explain code or text included in the request is NOT this.",
+      "The request asks for a technical audit, verdict, or report about the codebase or repository's current state (what changed in commits, what is broken in the repo, or a codebase health check) that can only be answered after running tools to inspect multiple files, git diffs, or logs not provided in the prompt (e.g. 'summarize what changed in the statusline', 'is everything ok here?'). Casual greetings, small talk, social check-ins, or open conversational questions to the assistant (e.g. 'bom dia', 'tudo bem?', 'tudo indo bem?', 'o que tens hoje?', 'how are you?', 'what do you have today?'), as well as requests to make a specific edit, run a named command, or explain code/text included in the prompt, are NOT this.",
   },
 } as const satisfies Record<RiskQuestion, unknown>;
 

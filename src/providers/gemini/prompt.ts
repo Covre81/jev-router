@@ -1,9 +1,77 @@
 import type { MessagesBody } from '../../routing/messages-body.js';
 
 const SYSTEM_REMINDER = /<system-reminder>([\s\S]*?)<\/system-reminder>/g;
+const ENV_OR_HANDOFF_BLOCK = /<(?:env|session_handoff)>[\s\S]*?<\/(?:env|session_handoff)>/g;
+const MAX_TOOLS_SECTION_CHARS = 16_000;
+
+function extractSystemEnv(system: unknown): string {
+  if (!system) return '';
+  const raw =
+    typeof system === 'string'
+      ? system
+      : Array.isArray(system)
+        ? system
+            .filter((b): b is { type: string; text: string } => Boolean(b && typeof b === 'object' && (b as any).type === 'text' && typeof (b as any).text === 'string'))
+            .map((b) => b.text)
+            .join('\n')
+        : '';
+  if (!raw) return '';
+  const matches = raw.match(ENV_OR_HANDOFF_BLOCK);
+  if (!matches || matches.length === 0) return '';
+  return matches.join('\n\n') + '\n\n';
+}
+
+function renderClientTools(tools: unknown[]): string {
+  const lines: string[] = [
+    'Available Client Tools (emit <jev_tool_use>{"name":"ToolName","input":{...}}</jev_tool_use> to call):',
+  ];
+  let totalChars = lines[0]!.length;
+
+  for (const raw of tools) {
+    if (!raw || typeof raw !== 'object') continue;
+    const t = raw as { name?: unknown; description?: unknown; input_schema?: unknown };
+    if (typeof t.name !== 'string' || !t.name) continue;
+    const desc =
+      typeof t.description === 'string'
+        ? t.description.replace(/\s+/g, ' ').trim().slice(0, 220)
+        : '';
+    let schemaStr = '{}';
+    if (t.input_schema && typeof t.input_schema === 'object') {
+      const s = t.input_schema as { properties?: Record<string, any>; required?: string[] };
+      const props: Record<string, string> = {};
+      if (s.properties && typeof s.properties === 'object') {
+        for (const [k, v] of Object.entries(s.properties)) {
+          const pType = v && typeof v === 'object' && typeof v.type === 'string' ? v.type : 'any';
+          const req = Array.isArray(s.required) && s.required.includes(k) ? ' (required)' : '';
+          props[k] = `${pType}${req}`;
+        }
+      }
+      schemaStr = JSON.stringify(props);
+    }
+    const line = `- ${t.name}: ${desc} | input: ${schemaStr}`;
+    if (totalChars + line.length + 1 > MAX_TOOLS_SECTION_CHARS) break;
+    lines.push(line);
+    totalChars += line.length + 1;
+  }
+
+  return lines.length > 1 ? lines.join('\n') + '\n\n' : '';
+}
 
 export function renderGeminiPrompt(body: MessagesBody, maxChars: number): string | undefined {
-  const preambleText = "You are answering ONE turn of a conversation between a developer and a coding assistant. You have NO tools — do not try to read or write files, run commands or browse (any tool use is blocked and counts as failure). Answer the LAST user message using only the transcript. Reply in the same language the user writes in. Use Markdown. If a correct answer genuinely requires reading files not shown, running commands or editing files, reply with exactly JEV_NEEDS_TOOLS and nothing else.\n\n";
+  const rawTools = Array.isArray((body as any).tools) ? ((body as any).tools as unknown[]) : [];
+  const toolsSection = rawTools.length > 0 ? renderClientTools(rawTools) : '';
+
+  const preambleText = toolsSection
+    ? 'You are answering ONE turn of a conversation between a developer and a coding assistant.\n' +
+      'CRITICAL RULE FOR TOOLS: Do NOT invoke your built-in platform tools (such as view_file, write_to_file, replace_file_content, run_command, grep_search, find_by_name) directly — direct built-in tool calls are blocked by the sandbox.\n' +
+      'Instead, you have full permission to use the client tools listed under "Available Client Tools" below by emitting one or more XML blocks in your text response using this exact format:\n' +
+      '<jev_tool_use>{"name": "ToolName", "input": {"param": "value"}}</jev_tool_use>\n' +
+      'When you emit <jev_tool_use>...</jev_tool_use>, the client executes the tool in the real workspace and returns [tool result: ...] in the next turn so you can continue.\n' +
+      'If you do not need any tool for this turn, reply normally in the same language the user writes in using Markdown.\n\n' +
+      toolsSection
+    : 'You are answering ONE turn of a conversation between a developer and a coding assistant. You have NO tools — do not try to read or write files, run commands or browse (any tool use is blocked and counts as failure). Answer the LAST user message using only the transcript. Reply in the same language the user writes in. Use Markdown. If a correct answer genuinely requires reading files not shown, running commands or editing files, reply with exactly JEV_NEEDS_TOOLS and nothing else.\n\n';
+
+  const envSection = extractSystemEnv((body as any).system);
 
   const reminderSet = new Set<string>();
   const reminderList: string[] = []; // kept in order of appearance
@@ -57,7 +125,7 @@ export function renderGeminiPrompt(body: MessagesBody, maxChars: number): string
           } else {
             content = JSON.stringify(bAny.content || {});
           }
-          text += `[tool result: ${content.substring(0, 4000)}]\n`;
+          text += `[tool result: ${content.substring(0, 12000)}]\n`;
         } else if (b.type === 'image') {
           text += `[image omitted]\n`;
         } else if (b.type === 'document') {
@@ -85,7 +153,7 @@ export function renderGeminiPrompt(body: MessagesBody, maxChars: number): string
     }
   }
 
-  const preamble = preambleText + finalReminders;
+  const preamble = preambleText + envSection + finalReminders;
 
   // Budget
   let prompt = preamble;
@@ -106,3 +174,4 @@ export function renderGeminiPrompt(body: MessagesBody, maxChars: number): string
   prompt += kept.join('');
   return prompt.trim();
 }
+

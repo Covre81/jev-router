@@ -23,14 +23,19 @@ const HookConfigSchema = z.looseObject({
 
 export async function runContextHook(explicitEnvFile?: string, exitFn: (code: number) => void = process.exit): Promise<number> {
   let watchdog: NodeJS.Timeout | undefined;
+  let stdoutWritten = false;
+  let isAntigravityInput = false;
   try {
     // 1. Parse config (using custom schema)
     const rawConfig = HookConfigSchema.parse(process.env);
     const budgetMs = rawConfig.CONTEXT_HOOK_BUDGET_MS;
-    let stdoutWritten = false;
 
     watchdog = setTimeout(() => {
       if (!stdoutWritten) {
+        if (isAntigravityInput) {
+          stdoutWritten = true;
+          process.stdout.write('{}');
+        }
         process.stderr.write(`[context] hook budget of ${budgetMs} ms exceeded, exiting without context\n`);
         exitFn(0);
       }
@@ -75,6 +80,12 @@ export async function runContextHook(explicitEnvFile?: string, exitFn: (code: nu
       return 0; // exit 0 without saving
     }
 
+    isAntigravityInput =
+      typeof rawInput === 'object' &&
+      rawInput !== null &&
+      'conversationId' in rawInput &&
+      !('session_id' in rawInput);
+
     // 3. Run Pipeline
     const result = await runPipeline(rawInput, config);
 
@@ -90,6 +101,10 @@ export async function runContextHook(explicitEnvFile?: string, exitFn: (code: nu
 
     return 0;
   } catch (err: any) {
+    if (isAntigravityInput && !stdoutWritten) {
+      stdoutWritten = true;
+      process.stdout.write('{}');
+    }
     process.stderr.write(`[context] Uncaught pipeline error: ${err.message}\n`);
     return 0; // Always exit 0 as per guidelines
   } finally {

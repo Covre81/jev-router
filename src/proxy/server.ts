@@ -8,6 +8,7 @@ import type { Route, Tier } from '../domain/policy.js';
 import type { CheapState } from '../providers/cheap-health.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
+import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
 import { latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
 import { needsReadFirstHint, withReadFirstHint, needsReadFirstFollowup, READ_FIRST_FOLLOWUP } from '../routing/read-first-hint.js';
 import type { RouteDecision, Router } from '../routing/router.js';
@@ -164,13 +165,36 @@ export function buildServer({
     const cheapProvider = standard ? providers.standard! : providers.cheap;
     const cheapModel = standard ? (config.cheapStandard?.model ?? config.cheap.model) : config.cheap.model;
 
-    let cheapReq = { ...base };
-    if (decision.route === 'cheap' && config.cheapReadFirstHint && base.body && needsReadFirstHint(base.body)) {
-      const hintedBody = withReadFirstHint(base.body);
+    let activeBase = base;
+    if (decision.modelTransition && decision.previousTier && decision.tier && base.body) {
+      try {
+        const handoffBlock = await buildTransitionHandoff({
+          body: base.body,
+          previousTier: decision.previousTier,
+          currentTier: decision.tier,
+        });
+        const handoffBody = withTransitionHandoff(base.body, handoffBlock);
+        activeBase = {
+          ...base,
+          body: handoffBody,
+          rawBody: Buffer.from(JSON.stringify(handoffBody)),
+        };
+        req.log.info(
+          { conversation: decision.conversationKey, from: decision.previousTier, to: decision.tier },
+          'model transition handoff injected',
+        );
+      } catch (err) {
+        req.log.warn({ err, conversation: decision.conversationKey }, 'model transition handoff failed');
+      }
+    }
+
+    let cheapReq = { ...activeBase };
+    if (decision.route === 'cheap' && config.cheapReadFirstHint && activeBase.body && needsReadFirstHint(activeBase.body)) {
+      const hintedBody = withReadFirstHint(activeBase.body);
       cheapReq = { ...cheapReq, body: hintedBody, rawBody: Buffer.from(JSON.stringify(hintedBody)) };
       req.log.info({ conversation: decision.conversationKey }, 'read-first hint added');
-    } else if (decision.route === 'cheap' && config.cheapReadFirstHint && base.body && needsReadFirstFollowup(base.body)) {
-      const hintedBody = withReadFirstHint(base.body, READ_FIRST_FOLLOWUP);
+    } else if (decision.route === 'cheap' && config.cheapReadFirstHint && activeBase.body && needsReadFirstFollowup(activeBase.body)) {
+      const hintedBody = withReadFirstHint(activeBase.body, READ_FIRST_FOLLOWUP);
       cheapReq = { ...cheapReq, body: hintedBody, rawBody: Buffer.from(JSON.stringify(hintedBody)) };
       req.log.info({ conversation: decision.conversationKey }, 'read-first follow-up added');
     }
@@ -268,10 +292,11 @@ export function buildServer({
     if (decision.route === 'gemini') {
       const fallbackToPrimary = async (reason: import('../routing/router.js').RouteReason) => {
         const routeDec: RouteDecision = { ...decision, route: 'primary', reason };
-        return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+        return relay(reply, await sendPrimary(activeBase), routeDec, req, exchange('primary'));
       };
 
       const doFallback = async (reason: import('../routing/router.js').RouteReason) => {
+        router.clearGeminiLoop(decision);
         if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
           return fallbackToPrimary(reason);
         }
@@ -303,7 +328,7 @@ export function buildServer({
 
       let outcome: 'success' | 'failure' | 'neutral' = 'failure';
       try {
-        const res = await providers.gemini.send(base);
+        const res = await providers.gemini.send(activeBase);
         if (res.kind === 'response') {
           outcome = 'success';
           return relay(reply, res, decision, req, exchange('gemini'));
@@ -329,7 +354,7 @@ export function buildServer({
     if (decision.route === 'cheap' && cheapHealth?.state === 'down') {
       const skipped: RouteDecision = { ...decision, route: 'primary', reason: 'skipped:cheap-unhealthy' };
       upstreamFailureState = { failure: 'skipped' };
-      return relay(reply, await sendPrimary(base), skipped, req, exchange('primary'));
+      return relay(reply, await sendPrimary(activeBase), skipped, req, exchange('primary'));
     }
 
     if (decision.route === 'cheap') {
@@ -349,10 +374,10 @@ export function buildServer({
       router.pinToPrimary(decision);
       const failover: RouteDecision = { ...decision, route: 'primary', reason: 'failover:cheap-unavailable' };
       req.log.warn({ reason: cheap.reason, conversation: decision.conversationKey }, 'cheap provider unavailable');
-      return relay(reply, await sendPrimary(base), failover, req, exchange('primary'));
+      return relay(reply, await sendPrimary(activeBase), failover, req, exchange('primary'));
     }
 
-    const primary = await sendPrimary(base);
+    const primary = await sendPrimary(activeBase);
     if (
       primary.kind === 'unavailable' ||
       !config.router.failoverOnPrimaryRateLimit ||

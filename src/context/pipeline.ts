@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { getMachineOrigin } from './origin.js';
 import { searchMemory, type MemoryHit } from './memory-source.js';
@@ -12,15 +12,60 @@ import { recordContextRun, type ContextCandidateInput, type ContextOutcome } fro
 import { openTelemetryDb } from '../telemetry/db.js';
 import { defaultTelemetryDbPath } from '../paths.js';
 
-// Schema for input from stdin
-const StdinSchema = z.looseObject({
+/** Cap the prompt sent to JEV System One so large pasted logs never trigger HTTP 400. */
+export const MAX_JEV_PROMPT_CHARS = 4_000;
+
+// Schema for Claude Code UserPromptSubmit stdin
+const ClaudeStdinSchema = z.looseObject({
   prompt: z.string(),
   session_id: z.string(),
   cwd: z.string(),
   transcript_path: z.string().optional(),
 });
 
-export type ContextInput = z.infer<typeof StdinSchema>;
+// Schema for Antigravity / agy PreInvocation stdin
+const AntigravityStdinSchema = z.looseObject({
+  conversationId: z.string().min(1),
+  workspacePaths: z.array(z.string()).optional(),
+  transcriptPath: z.string().optional(),
+  cwd: z.string().optional(),
+  prompt: z.string().optional(),
+});
+
+export type ContextInput = z.infer<typeof ClaudeStdinSchema>;
+
+/**
+ * Reads the latest non-ephemeral step from an Antigravity/agy transcript.jsonl.
+ * Returns the user prompt only when the latest turn is a fresh USER_INPUT step
+ * (skipping tool-call continuation invocations).
+ */
+export function extractAntigravityPrompt(transcriptPath: string): string | undefined {
+  try {
+    if (!existsSync(transcriptPath)) return undefined;
+    const raw = readFileSync(transcriptPath, 'utf8');
+    const lines = raw.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let step: any;
+      try {
+        step = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const type = step?.type;
+      if (type === 'EPHEMERAL_MESSAGE' || type === 'CHECKPOINT') continue;
+      if (type !== 'USER_INPUT') return undefined;
+      const content = typeof step?.content === 'string' ? step.content : '';
+      const match = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i.exec(content);
+      const extracted = (match ? match[1]! : content).trim();
+      return extracted.length > 0 ? extracted : undefined;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export interface PipelineConfig {
   readonly mode: 'inject' | 'shadow' | 'off';
@@ -51,13 +96,36 @@ export async function runPipeline(
   config: PipelineConfig
 ): Promise<PipelineResult> {
   const startedAt = performance.now();
-  // 1. Validate stdin
-  const parsedInput = StdinSchema.safeParse(rawInput);
-  if (!parsedInput.success) {
-    // Stdin inválido: sai sem gravar (as per instructions)
-    throw new Error('invalid_stdin');
+  // 1. Validate stdin (Claude Code UserPromptSubmit or Antigravity/agy PreInvocation)
+  let input: ContextInput;
+  let isAntigravity = false;
+  let emptyStdout = '';
+
+  const parsedClaude = ClaudeStdinSchema.safeParse(rawInput);
+  if (parsedClaude.success) {
+    input = parsedClaude.data;
+  } else {
+    const parsedAgy = AntigravityStdinSchema.safeParse(rawInput);
+    if (!parsedAgy.success) {
+      // Stdin inválido: sai sem gravar (as per instructions)
+      throw new Error('invalid_stdin');
+    }
+    isAntigravity = true;
+    emptyStdout = '{}';
+    const cwd = parsedAgy.data.cwd ?? parsedAgy.data.workspacePaths?.[0] ?? '';
+    const prompt =
+      parsedAgy.data.prompt ??
+      (parsedAgy.data.transcriptPath ? extractAntigravityPrompt(parsedAgy.data.transcriptPath) : undefined);
+    if (!prompt || !cwd) {
+      return { outcome: 'skipped_origin', stdout: emptyStdout };
+    }
+    input = {
+      prompt,
+      session_id: parsedAgy.data.conversationId,
+      cwd,
+      transcript_path: parsedAgy.data.transcriptPath,
+    };
   }
-  const input = parsedInput.data;
 
   // Labels go stale when the questions or the knobs change: hash what JEV is actually asked.
   const pipelineVersionInput = JSON.stringify({
@@ -110,23 +178,23 @@ export async function runPipeline(
   const machineOrigin = getMachineOrigin(input.prompt);
   if (machineOrigin) {
     record('skipped_origin', machineOrigin);
-    return { outcome: 'skipped_origin', stdout: '' };
+    return { outcome: 'skipped_origin', stdout: emptyStdout };
   }
 
   if (config.mode === 'off') {
-    return { outcome: 'ok', stdout: '' };
+    return { outcome: 'ok', stdout: emptyStdout };
   }
 
   if (!isProjectDir(input.cwd)) {
     record('skipped_cwd', 'cwd is not a project');
-    return { outcome: 'skipped_cwd', stdout: '' };
+    return { outcome: 'skipped_cwd', stdout: emptyStdout };
   }
 
   // 3. Check for API key configuration
   if (!config.apiKey) {
     const error = 'TYPESAFE_API_KEY is not set';
     record('config_error', error);
-    return { outcome: 'config_error', stdout: '', error };
+    return { outcome: 'config_error', stdout: emptyStdout, error };
   }
 
   // Setup AbortController for global timeout
@@ -196,6 +264,7 @@ export async function runPipeline(
 
   if (finalOutcome !== 'timeout' && finalOutcome !== 'source_error') {
     const client = new JevClient({ apiUrl: config.apiUrl, apiKey: config.apiKey });
+    const jevPrompt = input.prompt.slice(0, MAX_JEV_PROMPT_CHARS);
 
     try {
       // 5. JEV Stage 1 Choice (rank communities)
@@ -204,7 +273,7 @@ export async function runPipeline(
         selectedCommunities = await rankCommunities({
           client,
           model: config.model,
-          prompt: input.prompt,
+          prompt: jevPrompt,
           graphs: graphSources,
           signal: controller.signal,
         });
@@ -251,7 +320,7 @@ export async function runPipeline(
       const scoredCandidates = await scoreCandidates({
         client,
         model: config.model,
-        prompt: input.prompt,
+        prompt: jevPrompt,
         candidates: candidatesList,
         signal: controller.signal,
       });
@@ -396,14 +465,22 @@ export async function runPipeline(
   record(finalOutcome, error, evaluatedCandidates, hasInjected ? injectedContextStr.length : 0);
 
   // 10. Stdout Output
-  let stdoutResult = '';
+  let stdoutResult = emptyStdout;
   if (config.mode === 'inject' && hasInjected) {
-    stdoutResult = JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'UserPromptSubmit',
-        additionalContext: injectedContextStr,
-      },
-    });
+    stdoutResult = isAntigravity
+      ? JSON.stringify({
+          injectSteps: [
+            {
+              ephemeralMessage: injectedContextStr,
+            },
+          ],
+        })
+      : JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'UserPromptSubmit',
+            additionalContext: injectedContextStr,
+          },
+        });
   }
 
   return {

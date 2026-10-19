@@ -20,16 +20,19 @@ const safe = (id: unknown): id is string => typeof id === 'string' && SAFE_ID.te
 /** Windows: Defender or the indexer can hold a fresh file for a moment (EBUSY/EPERM). */
 const remove = (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 3 });
 
-/** The fields of a Claude Code hook payload the registry reads. */
+/** The fields of a Claude Code or Antigravity/agy hook payload the registry reads. */
 export interface AgentHookEvent {
   readonly hook_event_name?: unknown;
+  readonly hookEventName?: unknown;
   readonly session_id?: unknown;
+  readonly conversationId?: unknown;
   readonly agent_id?: unknown;
+  readonly agentId?: unknown;
   readonly source?: unknown;
 }
 
 /**
- * Applies one Claude Code hook event: SubagentStart adds the agent (again on a
+ * Applies one Claude Code or Antigravity hook event: SubagentStart adds the agent (again on a
  * resume, which restarts its clock), SubagentStop removes it, SessionEnd drops
  * the session. SessionStart sweeps what a crash left behind: a resumed session's
  * subagents died with the process that ran them, and folders of sessions never
@@ -39,9 +42,12 @@ export interface AgentHookEvent {
  * terminal's live count too; it fixes itself at their next Start.
  */
 export function recordAgentEvent(event: AgentHookEvent, dir = defaultAgentsDir(), now = Date.now()): void {
-  if (!safe(event.session_id)) return;
-  const session = join(dir, event.session_id);
-  switch (event.hook_event_name) {
+  const sessionId = event.session_id ?? event.conversationId;
+  if (!safe(sessionId)) return;
+  const session = join(dir, sessionId);
+  const eventName = event.hook_event_name ?? event.hookEventName;
+  const agentId = event.agent_id ?? event.agentId;
+  switch (eventName) {
     case 'SessionStart':
       if (event.source === 'resume') remove(session);
       sweepStale(dir, now);
@@ -50,12 +56,12 @@ export function recordAgentEvent(event: AgentHookEvent, dir = defaultAgentsDir()
       remove(session);
       return;
     case 'SubagentStart':
-      if (!safe(event.agent_id)) return;
+      if (!safe(agentId)) return;
       mkdirSync(session, { recursive: true });
-      writeFileSync(join(session, event.agent_id), '');
+      writeFileSync(join(session, agentId), '');
       return;
     case 'SubagentStop':
-      if (safe(event.agent_id)) remove(join(session, event.agent_id));
+      if (safe(agentId)) remove(join(session, agentId));
       return;
   }
 }

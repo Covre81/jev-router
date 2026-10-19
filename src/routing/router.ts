@@ -41,6 +41,8 @@ export interface RouteDecision {
   /** Which cheap model serves a cheap route; absent on decisions built outside the router. */
   readonly tier?: Tier;
   readonly fallbackTier?: Tier;
+  readonly previousTier?: Tier;
+  readonly modelTransition?: boolean;
   readonly reason: RouteReason;
   readonly conversationKey: string | undefined;
   readonly distribution?: Classification;
@@ -95,6 +97,9 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini'>, number>> = { trivial: 
  *   - JEV failure fails toward primary — losing savings, never correctness.
  */
 export class Router {
+  private readonly lastRouteWasGemini = new Set<string>();
+  private readonly lastServedTier = new Map<string, Tier>();
+
   constructor(
     private readonly classifier: ComplexityClassifier,
     private readonly sessions: TtlLruStore<Tier>,
@@ -110,6 +115,7 @@ export class Router {
       ? `${ctx.sessionId}:${ctx.agentId ?? 'main'}`
       : `fp:${conversationFingerprint(ctx.body)}`;
     const fresh = isFreshConversation(ctx.body) || ctx.contextCompacted;
+    const prevServed: Tier | undefined = this.lastServedTier.get(key) ?? (!fresh ? this.sessions.get(key) : undefined);
     const inputTokens = estimateInputTokens(ctx.rawByteLength);
     const budget: Readonly<Record<Tier, number>> = {
       trivial: this.options.cheapContextTokens,
@@ -118,25 +124,39 @@ export class Router {
       gemini: Infinity,
     };
 
+    const stampTransition = (dec: RouteDecision): RouteDecision => {
+      const current = dec.tier ?? (dec.route === 'primary' ? 'primary' : dec.route === 'gemini' ? 'gemini' : 'trivial');
+      this.lastServedTier.set(key, current);
+      if (prevServed !== undefined && prevServed !== current) {
+        return { ...dec, previousTier: prevServed, modelTransition: true };
+      }
+      return dec;
+    };
+
     const resolve = (tier: Tier, reason: RouteReason, extra: Partial<RouteDecision> = {}): RouteDecision => {
       const escalatedByContext = inputTokens > budget[tier];
       const final: Tier = escalatedByContext ? 'primary' : tier;
       this.sessions.set(key, final);
-      return {
+      if (final === 'gemini') this.lastRouteWasGemini.add(key);
+      else this.lastRouteWasGemini.delete(key);
+      return stampTransition({
         ...extra,
         route: tierRoute(final),
         tier: final,
         reason: escalatedByContext ? 'escalated:context' : reason,
         conversationKey: key,
-      };
+      });
     };
-    const primary = (reason: RouteReason, extra: Partial<RouteDecision> = {}): RouteDecision => ({
-      ...extra,
-      route: 'primary',
-      tier: 'primary',
-      reason,
-      conversationKey: key,
-    });
+    const primary = (reason: RouteReason, extra: Partial<RouteDecision> = {}): RouteDecision => {
+      this.lastRouteWasGemini.delete(key);
+      return stampTransition({
+        ...extra,
+        route: 'primary',
+        tier: 'primary',
+        reason,
+        conversationKey: key,
+      });
+    };
 
     const level = this.options.quota?.level() ?? 'none';
     const pressure = this.options.pressurePolicy;
@@ -157,15 +177,31 @@ export class Router {
     const sticky: Tier | undefined = (fresh || stored === 'gemini') ? undefined : stored;
 
     const humanText = latestHumanText(ctx.body);
-    // Quota nearly gone: a new human turn on Claude may leave it. Tool loops never do.
-    const reclassify = level === 'critical' && humanText !== undefined && stored === 'primary' && (sticky === 'primary' || ctx.contextCompacted);
-    const classifyForGemini = this.options.geminiPolicy?.enabled && this.options.geminiFromPrimary && humanText !== undefined && sticky === 'primary' && !reclassify;
-
-    if (sticky === 'primary' && !reclassify && !classifyForGemini) return resolve('primary', 'sticky');
     if (humanText === undefined) {
+      if (
+        (stored === 'gemini' || this.lastRouteWasGemini.has(key)) &&
+        this.options.geminiPolicy?.enabled &&
+        !hasImageDocumentOrToolChoice(ctx.body)
+      ) {
+        this.lastRouteWasGemini.add(key);
+        const fallbackTier: Tier = stored === 'gemini' ? 'primary' : stored;
+        return stampTransition({
+          route: 'gemini',
+          tier: 'gemini',
+          fallbackTier,
+          reason: 'sticky',
+          conversationKey: key,
+        });
+      }
       if (stored === 'gemini') return primary('sticky');
       return sticky ? resolve(sticky, 'sticky') : primary('passthrough:no-session-state');
     }
+
+    // Quota nearly gone: a new human turn on Claude may leave it. Tool loops never do.
+    const reclassify = level === 'critical' && stored === 'primary' && (sticky === 'primary' || ctx.contextCompacted);
+    const classifyForGemini = this.options.geminiPolicy?.enabled && this.options.geminiFromPrimary && sticky === 'primary' && !reclassify;
+
+    if (sticky === 'primary' && !reclassify && !classifyForGemini) return resolve('primary', 'sticky');
 
     const started = performance.now();
     let distribution: Classification;
@@ -208,21 +244,22 @@ export class Router {
       } else if (stored === 'primary') {
         nextStored = 'primary';
       } else {
-        nextStored = stickyTier(sticky!, proposed);
+        nextStored = sticky!;
       }
       this.sessions.set(key, nextStored);
+      this.lastRouteWasGemini.add(key);
 
       const gp = this.options.geminiPolicy!;
       const barLowered = level !== 'none' && gp.pressureMinTextOnly < gp.minTextOnly;
-      const isPressure = barLowered && distribution.textOnly! < gp.minTextOnly;
-      return {
+      const isPressure = barLowered && (distribution.textOnly ?? 0) < gp.minTextOnly;
+      return stampTransition({
         ...extra,
         route: 'gemini',
         tier: 'gemini',
         fallbackTier: nextStored === 'gemini' ? 'primary' : nextStored,
         reason: isPressure ? 'gemini:text-only:pressure' : 'gemini:text-only',
         conversationKey: key,
-      };
+      });
     }
 
     if (classifyForGemini) {
@@ -251,12 +288,27 @@ export class Router {
 
   /** The cheap provider could not serve this conversation: keep it on the primary from now on. */
   pinToPrimary(decision: RouteDecision): void {
-    if (decision.conversationKey) this.sessions.set(decision.conversationKey, 'primary');
+    if (decision.conversationKey) {
+      this.sessions.set(decision.conversationKey, 'primary');
+      this.lastRouteWasGemini.delete(decision.conversationKey);
+      this.lastServedTier.set(decision.conversationKey, 'primary');
+    }
   }
 
   /** The standard tier was unavailable for a read-first turn: serve it on trivial. */
   useTrivial(decision: RouteDecision): void {
-    if (decision.conversationKey) this.sessions.set(decision.conversationKey, 'trivial');
+    if (decision.conversationKey) {
+      this.sessions.set(decision.conversationKey, 'trivial');
+      this.lastRouteWasGemini.delete(decision.conversationKey);
+      this.lastServedTier.set(decision.conversationKey, 'trivial');
+    }
+  }
+
+  /** Clear the active Gemini tool loop marker when a Gemini turn falls back to another provider. */
+  clearGeminiLoop(decision: RouteDecision): void {
+    if (decision.conversationKey) {
+      this.lastRouteWasGemini.delete(decision.conversationKey);
+    }
   }
 }
 
