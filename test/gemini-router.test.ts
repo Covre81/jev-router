@@ -61,7 +61,8 @@ describe('Router decisions', () => {
     const { router, store } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 });
     store.set('s6:main', 'gemini');
     const dec = await router.decide(req({ messages: [{ role: 'user', content: [{ type: 'tool_result' }] }] }, { 'x-claude-code-session-id': 's6' }) as any);
-    assert.equal(dec.route, 'primary');
+    assert.equal(dec.route, 'gemini');
+    assert.equal(dec.reason, 'sticky');
   });
 
   it('next human turn of a gemini conversation can return trivial', async () => {
@@ -120,5 +121,60 @@ describe('Router decisions', () => {
     const dec = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }] }, { 'x-claude-code-session-id': 's14' }) as any);
     assert.equal(dec.route, 'primary');
     assert.equal(dec.reason, 'classified');
+  });
+
+  it('walks the full economy ladder: trivial -> standard -> gemini (with tools) -> primary only at the last moment', async () => {
+    const scripts = [
+      // Turn 1: simple -> trivial (gpt-oss:20b-cloud)
+      { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, riskScores: { security_sensitive: 0.01, destructive_or_production: 0.01, requires_inspection: 0.05 }, textOnly: 0.95 },
+      // Turn 2: level-2 -> standard (gemma4:31b-cloud)
+      { simple: 0.3, standard: 0.55, structural: 0.15, risk: 0.9, riskScores: { security_sensitive: 0.02, destructive_or_production: 0.02, requires_inspection: 0.9 }, textOnly: 0.05 },
+      // Turn 3: structural requiring tools -> gemini (gemini-3.8-flash-high), keeps session sticky at standard
+      { simple: 0.05, standard: 0.1, structural: 0.85, risk: 0.95, riskScores: { security_sensitive: 0.05, destructive_or_production: 0.05, requires_inspection: 0.95 }, textOnly: 0.02 },
+      // Turn 4: simple follow-up -> stays at standard (not pinned to primary!)
+      { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, riskScores: { security_sensitive: 0.01, destructive_or_production: 0.01, requires_inspection: 0.05 }, textOnly: 0.9 },
+      // Turn 5: security/destructive high risk -> finally escalates to primary (Claude) at the last moment
+      { simple: 0.05, standard: 0.1, structural: 0.85, risk: 0.95, riskScores: { security_sensitive: 0.95, destructive_or_production: 0.1, requires_inspection: 0.9 }, textOnly: 0.02 },
+    ];
+    const classifier = { name: 'test', classify: async () => scripts.shift()! };
+    const store = new TtlLruStore<any>(100, 60_000);
+    const router = new Router(classifier as any, store, {
+      policy: { minCheapProbability: 0.9, standardRoute: 'primary', standardEnabled: true, minStandardProbability: 0.75 },
+      primaryClasses: new Set(['auxiliary']),
+      cheapContextTokens: 100_000,
+      standardContextTokens: 250_000,
+      geminiPolicy: { enabled: true, minTextOnly: 0, pressureMinTextOnly: 0 },
+      geminiFromPrimary: true,
+      classifierMaxChars: 4000,
+      classifierTimeoutMs: 1000,
+      quota: { level: () => 'none' },
+    });
+
+    const sid = { 'x-claude-code-session-id': 's-ladder' };
+    const m1 = [{ role: 'user', content: 't1' }];
+    const d1 = await router.decide(req({ messages: m1 }, sid) as any);
+    assert.deepEqual([d1.route, d1.tier, d1.reason], ['cheap', 'trivial', 'classified']);
+
+    const m2 = [...m1, { role: 'assistant', content: 'a1' }, { role: 'user', content: 't2' }];
+    const d2 = await router.decide(req({ messages: m2 }, sid) as any);
+    assert.deepEqual([d2.route, d2.tier, d2.reason], ['cheap', 'standard', 'escalated:standard']);
+
+    const m3 = [...m2, { role: 'assistant', content: 'a2' }, { role: 'user', content: 't3' }];
+    const d3 = await router.decide(req({ messages: m3 }, sid) as any);
+    assert.deepEqual([d3.route, d3.tier, d3.fallbackTier, d3.reason], ['gemini', 'gemini', 'standard', 'gemini:text-only']);
+    assert.equal(store.get('s-ladder:main'), 'standard');
+
+    // Tool-result continuation of Turn 3 stays on gemini!
+    const m3Tool = [...m3, { role: 'assistant', content: [{ type: 'tool_use', id: '1', name: 'Read', input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: '1', content: 'ok' }] }];
+    const d3Tool = await router.decide(req({ messages: m3Tool }, sid) as any);
+    assert.deepEqual([d3Tool.route, d3Tool.tier, d3Tool.fallbackTier, d3Tool.reason], ['gemini', 'gemini', 'standard', 'sticky']);
+
+    const m4 = [...m3Tool, { role: 'assistant', content: 'a3' }, { role: 'user', content: 't4' }];
+    const d4 = await router.decide(req({ messages: m4 }, sid) as any);
+    assert.deepEqual([d4.route, d4.tier, d4.reason], ['cheap', 'standard', 'sticky']);
+
+    const m5 = [...m4, { role: 'assistant', content: 'a4' }, { role: 'user', content: 't5' }];
+    const d5 = await router.decide(req({ messages: m5 }, sid) as any);
+    assert.deepEqual([d5.route, d5.tier, d5.reason], ['primary', 'primary', 'escalated']);
   });
 });

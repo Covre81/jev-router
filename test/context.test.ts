@@ -378,6 +378,78 @@ describe('context-pipeline', () => {
       hung.server.close();
     }
   });
+
+  it('truncates oversized prompts sent to JEV at 4000 chars while recording the full prompt length', async () => {
+    const seenBodies: any[] = [];
+    const inspectServer = await listen(async (req, res) => {
+      const body = await readBody(req);
+      seenBodies.push(body);
+      answerLikeJev(body, res, 0.95);
+    });
+    try {
+      const hugePrompt = `how does selectRoute work? ${'x'.repeat(12_000)}`;
+      const res = await runPipeline(input('sess-huge', hugePrompt), baseConfig(inspectServer.url, { graphRoot: dir }));
+      assert.strictEqual(res.outcome, 'ok');
+      assert.ok(seenBodies.length >= 2);
+      for (const b of seenBodies) {
+        assert.ok(typeof b.state === 'string' && b.state.length <= 4_020, `state too large: ${b.state.length}`);
+        for (const q of Object.values<any>(b.questions ?? {})) {
+          if (typeof q.instructions === 'string') {
+            assert.ok(q.instructions.length < 1_000, `question instructions repeated prompt: ${q.instructions.length}`);
+          }
+        }
+      }
+      const run = lastRun('sess-huge');
+      assert.strictEqual(run.prompt_chars, hugePrompt.length);
+    } finally {
+      inspectServer.server.close();
+    }
+  });
+
+  it('supports Antigravity / agy PreInvocation payloads via transcriptPath and skips tool-continuation steps', async () => {
+    const transcriptFile = join(dir, 'transcript.jsonl');
+    writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>\nhow does selectRoute apply the risk veto?\n</USER_REQUEST>' }),
+        JSON.stringify({ step_index: 1, type: 'EPHEMERAL_MESSAGE', content: 'some reminder' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const agyRes = await runPipeline(
+      {
+        conversationId: 'agy-conv-1',
+        workspacePaths: [join(dir, 'proj')],
+        transcriptPath: transcriptFile,
+      },
+      baseConfig(ok.url, { graphRoot: dir }),
+    );
+    assert.strictEqual(agyRes.outcome, 'ok');
+    const parsed = JSON.parse(agyRes.stdout);
+    assert.ok(Array.isArray(parsed.injectSteps));
+    assert.match(parsed.injectSteps[0].ephemeralMessage, /\[grafo\] proj › /);
+
+    // Tool continuation step (last non-ephemeral step is PLANNER_RESPONSE): must skip without calling JEV
+    writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({ step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>\nhello\n</USER_REQUEST>' }),
+        JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', content: 'calling tool' }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const contRes = await runPipeline(
+      {
+        conversationId: 'agy-conv-1',
+        workspacePaths: [join(dir, 'proj')],
+        transcriptPath: transcriptFile,
+      },
+      baseConfig('http://127.0.0.1:1/v1/systemone', { graphRoot: dir }),
+    );
+    assert.strictEqual(contRes.outcome, 'skipped_origin');
+    assert.strictEqual(contRes.stdout, '{}');
+  });
 });
 
 describe('context-log', () => {

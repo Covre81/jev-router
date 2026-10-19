@@ -33,10 +33,10 @@ describe('Gemini tier unit tests', () => {
     it('GEMINI_TIER=on gives correct defaults', () => {
       const c = loadConfig({ CHEAP_API_KEY: 'k', CLASSIFIER: 'heuristic', GEMINI_TIER: 'on', JEV_ROUTER_HOME: '/jev-home' });
       assert.ok(c.gemini);
-      assert.equal(c.gemini.model, 'gemini-3.1-pro-high');
+      assert.equal(c.gemini.model, 'gemini-3.8-flash-high');
       assert.equal(c.gemini.timeoutMs, 60000);
-      assert.equal(c.gemini.minTextOnly, 0.8);
-      assert.equal(c.gemini.pressureMinTextOnly, 0.6);
+      assert.equal(c.gemini.minTextOnly, 0);
+      assert.equal(c.gemini.pressureMinTextOnly, 0);
       assert.equal(c.gemini.fromPrimary, true);
       assert.equal(c.gemini.maxConcurrency, 1);
       assert.equal(c.gemini.maxPromptChars, 200000);
@@ -101,6 +101,41 @@ describe('Gemini tier unit tests', () => {
       assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.79 }, 'primary', opts, 'none'), false);
       assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.8 }, 'primary', opts, 'none'), true);
       assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.65 }, 'primary', opts, 'pressure'), true);
+
+      // Tool-enabled mode (minTextOnly=0): allows requires_inspection >= 0.5 and low textOnly, blocks only hardRisk >= 0.5
+      const toolOpts = { enabled: true, minTextOnly: 0, pressureMinTextOnly: 0 };
+      assert.equal(
+        geminiEligible(
+          {
+            simple: 0.05,
+            standard: 0.15,
+            structural: 0.8,
+            risk: 0.95,
+            riskScores: { security_sensitive: 0.05, destructive_or_production: 0.05, requires_inspection: 0.95 },
+            textOnly: 0.02,
+          },
+          'primary',
+          toolOpts,
+          'none',
+        ),
+        true,
+      );
+      assert.equal(
+        geminiEligible(
+          {
+            simple: 0.05,
+            standard: 0.15,
+            structural: 0.8,
+            risk: 0.92,
+            riskScores: { security_sensitive: 0.92, destructive_or_production: 0.05, requires_inspection: 0.5 },
+            textOnly: 0.02,
+          },
+          'primary',
+          toolOpts,
+          'none',
+        ),
+        false,
+      );
     });
   });
 
@@ -416,6 +451,31 @@ describe('Gemini tier unit tests', () => {
       const prompt = renderGeminiPrompt(body, 200000);
       assert.ok(prompt!.includes('[tool result: result text]'));
     });
+
+    it('renders Available Client Tools and extracts <env> from body.system when tools are provided', () => {
+      const body: MessagesBody = {
+        model: 'm',
+        system: [{ type: 'text', text: 'LONG SYSTEM PROMPT\n<env>\nWorking directory: C:\\Dev\\JEV-APP-PC\n</env>\nMORE SYSTEM' }],
+        tools: [
+          {
+            name: 'Read',
+            description: 'Reads a file from the local filesystem.',
+            input_schema: {
+              type: 'object',
+              properties: { file_path: { type: 'string' }, limit: { type: 'number' } },
+              required: ['file_path'],
+            },
+          },
+        ],
+        messages: [{ role: 'user', content: 'read package.json' }],
+      } as any;
+      const prompt = renderGeminiPrompt(body, 200000);
+      assert.ok(prompt);
+      assert.ok(!prompt.includes('LONG SYSTEM PROMPT'));
+      assert.ok(prompt.includes('<env>\nWorking directory: C:\\Dev\\JEV-APP-PC\n</env>'));
+      assert.ok(prompt.includes('Available Client Tools'));
+      assert.ok(prompt.includes('- Read: Reads a file from the local filesystem. | input: {"file_path":"string (required)","limit":"number"}'));
+    });
   });
 
   describe('Breaker', () => {
@@ -566,6 +626,62 @@ describe('Gemini tier unit tests', () => {
       assert.equal(reconstructed, longText);
       assert.equal(stopReason, 'end_turn');
       assert.ok(msgStop);
+    });
+
+    it('translates <jev_tool_use> into Anthropic tool_use blocks in both JSON and SSE modes', async () => {
+      const responseWithTools =
+        'Vou ler o arquivo.\n<jev_tool_use>{"name":"Read","input":{"file_path":"package.json"}}</jev_tool_use>';
+      const makeSpawn = () => () => {
+        const fakeChild = new EventEmitter() as any;
+        fakeChild.stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+        fakeChild.stdout = new EventEmitter();
+        fakeChild.stderr = new EventEmitter();
+        fakeChild.pid = 205;
+        setTimeout(() => {
+          fakeChild.stdout.emit(
+            'data',
+            Buffer.from(
+              JSON.stringify({
+                event: 'result',
+                result: { status: 'SUCCESS', response: responseWithTools, usage: { input_tokens: 12, output_tokens: 18 } },
+              }) + '\n',
+            ),
+          );
+          fakeChild.emit('close', 0);
+        }, 5);
+        return fakeChild;
+      };
+
+      const pJson = new GeminiCliProvider({
+        bin: 'agy', model: 'model1', timeoutMs: 1000, home: '/tmp/home', maxPromptChars: 5000, spawnFn: makeSpawn()
+      } as any);
+      const resJson = await pJson.send({ body: { model: 'other', messages: [{ role: 'user', content: 'read' }] } } as any);
+      assert.equal(resJson.kind, 'response');
+      const meteredJson = meterAnthropicBody((resJson as any).body, 'application/json', undefined);
+      let jsonStr = '';
+      for await (const chunk of meteredJson.body) jsonStr += chunk.toString();
+      await meteredJson.settled;
+      assert.equal(meteredJson.toolCalls(), 1);
+      const parsedJson = JSON.parse(jsonStr);
+      assert.equal(parsedJson.stop_reason, 'tool_use');
+      assert.equal(parsedJson.content.length, 2);
+      assert.deepEqual(parsedJson.content[0], { type: 'text', text: 'Vou ler o arquivo.' });
+      assert.equal(parsedJson.content[1].type, 'tool_use');
+      assert.equal(parsedJson.content[1].name, 'Read');
+      assert.deepEqual(parsedJson.content[1].input, { file_path: 'package.json' });
+
+      const pSse = new GeminiCliProvider({
+        bin: 'agy', model: 'model1', timeoutMs: 1000, home: '/tmp/home', maxPromptChars: 5000, spawnFn: makeSpawn()
+      } as any);
+      const resSse = await pSse.send({ body: { model: 'other', messages: [{ role: 'user', content: 'read' }], stream: true } } as any);
+      assert.equal(resSse.kind, 'response');
+      const meteredSse = meterAnthropicBody((resSse as any).body, 'text/event-stream', undefined);
+      let sseStr = '';
+      for await (const chunk of meteredSse.body) sseStr += chunk.toString();
+      await meteredSse.settled;
+      assert.equal(meteredSse.toolCalls(), 1);
+      assert.ok(sseStr.includes('"type":"tool_use"'));
+      assert.ok(sseStr.includes('"stop_reason":"tool_use"'));
     });
 
     it('JEV_NEEDS_TOOLS and prompt over budget', async () => {

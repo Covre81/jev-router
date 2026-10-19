@@ -218,10 +218,13 @@ describe('statusline', () => {
     assert.equal(await run('1'), `${JSON.stringify({ text: 'jev-router ✗ offline', level: 'critical' })}\n`);
   });
 
-  it('reads the session id from the JSON Claude Code pipes in, and gives up on silence', async () => {
+  it('reads the session id from the JSON Claude Code or Antigravity pipes in, and gives up on silence', async () => {
     const piped = new PassThrough();
     piped.end(JSON.stringify({ session_id: 'abc', model: { id: 'x' } }));
     assert.equal(await readSessionId(piped as unknown as NodeJS.ReadStream), 'abc');
+    const agyPiped = new PassThrough();
+    agyPiped.end(JSON.stringify({ conversationId: 'conv-123' }));
+    assert.equal(await readSessionId(agyPiped as unknown as NodeJS.ReadStream), 'conv-123');
     assert.equal(await readSessionId(new PassThrough() as unknown as NodeJS.ReadStream), undefined);
   });
 });

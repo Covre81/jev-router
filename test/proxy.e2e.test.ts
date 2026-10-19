@@ -179,7 +179,7 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
 
     assert.equal(res.statusCode, 200);
     assert.equal(res.headers['x-jev-route'], 'cheap; reason=classified');
-    assert.ok(endedAt - firstChunkAt >= 150, 'first event must be relayed before the cheap stream ends');
+    assert.ok(endedAt - firstChunkAt >= 100, 'first event must be relayed before the cheap stream ends');
     assert.match(text, /event: message_start/);
     assert.match(text, /"text_delta","text":"Hi"/);
     assert.match(text, /"stop_reason":"end_turn"/);

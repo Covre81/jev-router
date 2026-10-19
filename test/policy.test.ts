@@ -57,9 +57,35 @@ describe('selectTier', () => {
     assert.equal(selectTier({ simple: 0.3, standard: 0.3, structural: 0.4 }, tiers), 'primary');
   });
 
-  it('lets the risk veto beat every tier', () => {
+  it('lets the risk veto beat every tier, while escalating inspection-only risk to standard when enabled', () => {
     assert.equal(selectTier({ simple: 0.5, standard: 0.45, structural: 0.05, risk: 0.6 }, tiers), 'primary');
     assert.equal(selectTier({ simple: 0.99, standard: 0.01, structural: 0, risk: 0.6 }, tiers), 'primary');
+    assert.equal(
+      selectTier(
+        {
+          simple: 0.95,
+          standard: 0,
+          structural: 0.05,
+          risk: 0.55,
+          riskScores: { security_sensitive: 0.04, destructive_or_production: 0.03, requires_inspection: 0.55 },
+        },
+        tiers,
+      ),
+      'standard',
+    );
+    assert.equal(
+      selectTier(
+        {
+          simple: 0.95,
+          standard: 0,
+          structural: 0.05,
+          risk: 0.8,
+          riskScores: { security_sensitive: 0.8, destructive_or_production: 0.03, requires_inspection: 0.1 },
+        },
+        tiers,
+      ),
+      'primary',
+    );
   });
 
   it('behaves like before when the standard tier is off', () => {
