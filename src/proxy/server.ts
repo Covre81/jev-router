@@ -122,7 +122,7 @@ export function buildServer({
   const proxyToken = config.primary.authMode === 'inject' ? config.proxyAuthToken : undefined;
   if (proxyToken) {
     app.addHook('onRequest', async (req, reply) => {
-      if (req.url === '/healthz') return;
+      if (req.url === '/healthz' || req.url.startsWith('/route/')) return;
       const presented = presentedCredential(req.headers);
       if (!presented || !sameSecret(presented, proxyToken)) {
         return reply.code(401).send(anthropicError('authentication_error', 'invalid proxy token'));
@@ -141,6 +141,12 @@ export function buildServer({
     quota: quota?.current() ? { ...quota.current(), level: quota.level() } : null,
     gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
   }));
+  // Why the main loop's last answer came from where it did: the session-telemetry mod shows it on a model switch.
+  const lastRoutes = new Map<string, { route: string; reason: string; at: string }>();
+  app.get<{ Params: { session: string } }>('/route/:session', async (req, reply) => {
+    const last = lastRoutes.get(`${req.params.session}:main`);
+    return last ?? reply.code(404).send({ error: 'no decision for this session' });
+  });
   app.post('/v1/messages', handleMessages);
   // count_tokens, /v1/models, HEAD /api/hello, … are Anthropic concerns: pass through.
   app.all('*', async (req, reply) => relay(reply, await sendPrimary(providerRequest(req, reply))));
@@ -166,7 +172,8 @@ export function buildServer({
     const cheapModel = standard ? (config.cheapStandard?.model ?? config.cheap.model) : config.cheap.model;
 
     let activeBase = base;
-    if (decision.modelTransition && decision.previousTier && decision.tier && base.body) {
+    // Never on Claude: it already reads the whole transcript, and a changed system prompt rewrites its prompt cache.
+    if (decision.modelTransition && decision.previousTier && decision.tier && decision.tier !== 'primary' && base.body) {
       try {
         const handoffBlock = await buildTransitionHandoff({
           body: base.body,
@@ -291,12 +298,13 @@ export function buildServer({
 
     if (decision.route === 'gemini') {
       const fallbackToPrimary = async (reason: import('../routing/router.js').RouteReason) => {
+        router.clearGeminiLoop(decision, 'primary');
         const routeDec: RouteDecision = { ...decision, route: 'primary', reason };
-        return relay(reply, await sendPrimary(activeBase), routeDec, req, exchange('primary'));
+        // base, not activeBase: the Gemini handoff in the system prompt would rewrite Claude's cache.
+        return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
       };
 
       const doFallback = async (reason: import('../routing/router.js').RouteReason) => {
-        router.clearGeminiLoop(decision);
         if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
           return fallbackToPrimary(reason);
         }
@@ -305,6 +313,7 @@ export function buildServer({
           return fallbackToPrimary(reason);
         }
 
+        router.clearGeminiLoop(decision, decision.fallbackTier);
         const fbProvider = (decision.fallbackTier === 'standard' && providers.standard) ? providers.standard : providers.cheap;
         const resFb = await doSendCheapWithRetry(fbProvider, { ...cheapReq, onStreamFailure: () => router.pinToPrimary(decision) });
         if (resFb.kind === 'response') {
@@ -354,7 +363,7 @@ export function buildServer({
     if (decision.route === 'cheap' && cheapHealth?.state === 'down') {
       const skipped: RouteDecision = { ...decision, route: 'primary', reason: 'skipped:cheap-unhealthy' };
       upstreamFailureState = { failure: 'skipped' };
-      return relay(reply, await sendPrimary(activeBase), skipped, req, exchange('primary'));
+      return relay(reply, await sendPrimary(base), skipped, req, exchange('primary'));
     }
 
     if (decision.route === 'cheap') {
@@ -374,7 +383,7 @@ export function buildServer({
       router.pinToPrimary(decision);
       const failover: RouteDecision = { ...decision, route: 'primary', reason: 'failover:cheap-unavailable' };
       req.log.warn({ reason: cheap.reason, conversation: decision.conversationKey }, 'cheap provider unavailable');
-      return relay(reply, await sendPrimary(activeBase), failover, req, exchange('primary'));
+      return relay(reply, await sendPrimary(base), failover, req, exchange('primary'));
     }
 
     const primary = await sendPrimary(activeBase);
@@ -448,6 +457,12 @@ export function buildServer({
     if (decision) {
       req?.log.info({ route: decision }, 'route decision');
       reply.header('x-jev-route', `${decision.route}; reason=${decision.reason}`);
+      const key = decision.conversationKey;
+      if (key?.endsWith(':main')) {
+        lastRoutes.delete(key); // re-insert at the end: the Map's order is then oldest-first
+        lastRoutes.set(key, { route: decision.route, reason: decision.reason, at: new Date().toISOString() });
+        if (lastRoutes.size > 500) lastRoutes.delete(lastRoutes.keys().next().value!);
+      }
     }
     reply.code(result.status).headers(result.headers);
     const body = audited

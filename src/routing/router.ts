@@ -304,10 +304,11 @@ export class Router {
     }
   }
 
-  /** Clear the active Gemini tool loop marker when a Gemini turn falls back to another provider. */
-  clearGeminiLoop(decision: RouteDecision): void {
+  /** A Gemini turn fell back: clear its tool loop and record who served it, so the next turn is no fake transition. */
+  clearGeminiLoop(decision: RouteDecision, served: Tier): void {
     if (decision.conversationKey) {
       this.lastRouteWasGemini.delete(decision.conversationKey);
+      this.lastServedTier.set(decision.conversationKey, served);
     }
   }
 }
