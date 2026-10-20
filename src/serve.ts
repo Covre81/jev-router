@@ -20,7 +20,7 @@ import { noopTelemetry, SqliteTelemetry, type TelemetrySink } from './telemetry/
 import { ensureAgyHome } from './providers/gemini/isolation.js';
 import { GeminiCliProvider } from './providers/gemini/provider.js';
 import { CursorCliProvider } from './providers/cursor/provider.js';
-import { CircuitBreaker } from './providers/gemini/breaker.js';
+import { CircuitBreaker } from './providers/breaker.js';
 
 // ponytail: fixed cap, one entry per live conversation. An evicted cheap
 // conversation is treated as unknown and goes primary: savings lost, never

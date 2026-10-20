@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { loadConfig } from '../src/config.js';
 import { Router } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
-import { CircuitBreaker } from '../src/providers/gemini/breaker.js';
+import { CircuitBreaker } from '../src/providers/breaker.js';
 import { buildServer } from '../src/proxy/server.js';
 import type { Provider, ProviderResult } from '../src/providers/provider.js';
 

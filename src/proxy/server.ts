@@ -28,8 +28,8 @@ export interface ServerDeps {
   readonly build?: BuildInfo;
   /** Fed from every Anthropic response's rate-limit headers; absent = quota routing off. */
   readonly quota?: QuotaStore;
-  readonly geminiBreaker?: import('../providers/gemini/breaker.js').CircuitBreaker;
-  readonly cursorBreaker?: import('../providers/gemini/breaker.js').CircuitBreaker;
+  readonly geminiBreaker?: import('../providers/breaker.js').CircuitBreaker;
+  readonly cursorBreaker?: import('../providers/breaker.js').CircuitBreaker;
 }
 
 /** Primary statuses that mean "no quota/capacity right now" (opt-in failover to cheap). */

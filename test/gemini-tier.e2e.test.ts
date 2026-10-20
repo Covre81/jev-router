@@ -15,7 +15,7 @@ import { Router } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
 import { AnthropicProvider } from '../src/providers/anthropic.js';
 import { GeminiCliProvider } from '../src/providers/gemini/provider.js';
-import { CircuitBreaker } from '../src/providers/gemini/breaker.js';
+import { CircuitBreaker } from '../src/providers/breaker.js';
 import { buildServer } from '../src/proxy/server.js';
 import { SqliteTelemetry } from '../src/telemetry/recorder.js';
 import { openTelemetryDb } from '../src/telemetry/db.js';

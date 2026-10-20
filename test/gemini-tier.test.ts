@@ -15,7 +15,7 @@ import { hasImageDocumentOrToolChoice } from '../src/routing/messages-body.js';
 import { geminiEligible } from '../src/domain/policy.js';
 import { renderGeminiPrompt } from '../src/providers/gemini/prompt.js';
 import { sseEvent } from '../src/providers/openai/sse.js';
-import { CircuitBreaker } from '../src/providers/gemini/breaker.js';
+import { CircuitBreaker } from '../src/providers/breaker.js';
 import { ensureAgyHome } from '../src/providers/gemini/isolation.js';
 import { rm, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
