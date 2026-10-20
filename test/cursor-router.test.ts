@@ -71,12 +71,24 @@ describe('router fallback-loop stickiness', () => {
     assert.notEqual(cont.route, 'cursor');
   });
 
-  it('6b. non-5h window does not hold the fallback tier on a human turn', async () => {
+  it('6b. 7d window with utilization 1 and future reset holds the fallback tier on a human turn', async () => {
     const snap: any = { utilization: 1, window: '7d', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
     const { router } = setup(() => snap);
     (router as any).markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'cursor');
     const dec = await router.decide(req(humanTurn));
+    assert.equal(dec.route, 'cursor');
+    assert.equal(dec.tier, 'cursor');
+  });
+
+  it('6c. 5h window at low utilization with future resetAt (transient 529) clears the loop and retries primary', async () => {
+    const snap: any = { utilization: 0.2, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const { router } = setup(() => snap);
+    (router as any).markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'cursor');
+    const dec = await router.decide(req(humanTurn));
     assert.equal(dec.route, 'primary');
+    // loop cleared: a tool continuation no longer sticks to cursor
+    const cont = await router.decide(req(toolTurn));
+    assert.notEqual(cont.route, 'cursor');
   });
 
   it('risk veto: loop human turn with high security risk => primary and loop cleared', async () => {

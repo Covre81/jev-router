@@ -286,13 +286,17 @@ export class Router {
         this.fallbackLoop.delete(key);
         return resolve('primary', 'classified', extra);
       }
-      // Hold the loop only while the gate has not cleared. Clear it only when
-      // a snapshot exists AND (its window is not 5h OR its reset has passed);
-      // no snapshot => stay on the loop tier.
+      // Hold the loop only while the quota is actually exhausted: a snapshot
+      // exists AND (utilization >= 1 OR status is 'rejected') AND its reset
+      // has not passed (or is unknown). Otherwise clear and retry Claude (a
+      // fresh 429 re-enters the cascade); no snapshot => stay on the loop tier.
       const snap = this.options.quota?.current?.();
       const gateClears =
         snap !== undefined &&
-        (!snap.window.includes('5h') || (snap.resetAt !== undefined && snap.resetAt.getTime() <= Date.now()));
+        !(
+          (snap.utilization >= 1 || snap.status === 'rejected') &&
+          (snap.resetAt === undefined || snap.resetAt.getTime() > Date.now())
+        );
       if (!gateClears) {
         return stampTransition({
           ...extra,
@@ -303,7 +307,7 @@ export class Router {
           fallbackLoop: loopActive,
         });
       }
-      // Window reset (or not a 5h window): Claude is retried; a fresh 429 re-enters the cascade.
+      // Quota not exhausted (or its reset has passed): Claude is retried; a fresh 429 re-enters the cascade.
       this.fallbackLoop.delete(key);
     }
 
