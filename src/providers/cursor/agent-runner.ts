@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { killTree } from '../cli-kill.js';
 import { existsSync, readdirSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -187,13 +188,5 @@ export async function runCursorAgent(
     });
   } finally {
     try { await rm(cwd, { recursive: true, force: true }); } catch {}
-  }
-}
-
-function killTree(pid: number) {
-  if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', pid.toString(), '/T', '/F'], { windowsHide: true }).on('error', () => {});
-  } else {
-    try { process.kill(pid, 'SIGKILL'); } catch {}
   }
 }

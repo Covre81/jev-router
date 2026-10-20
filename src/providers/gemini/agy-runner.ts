@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { killTree } from '../cli-kill.js';
 import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -185,13 +186,5 @@ export async function runAgy(
         }
       } catch {}
     }
-  }
-}
-
-function killTree(pid: number) {
-  if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', pid.toString(), '/T', '/F'], { windowsHide: true }).on('error', () => {});
-  } else {
-    try { process.kill(pid, 'SIGKILL'); } catch {}
   }
 }

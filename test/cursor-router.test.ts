@@ -27,7 +27,7 @@ describe('cursor config', () => {
 });
 
 describe('router fallback-loop stickiness', () => {
-  function setup(quotaCurrent: () => any, classification: any = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 0.1 }) {
+  function setup(quotaCurrent: () => any, classification: any = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 0.1 }, sessionTtlMs?: number) {
     const classifier = { name: 'test', calls: 0, classify: async () => { classifier.calls++; return classification; } };
     const store = new TtlLruStore<any>(100, 60_000);
     const router = new Router(classifier as any, store, {
@@ -36,6 +36,7 @@ describe('router fallback-loop stickiness', () => {
       cheapContextTokens: 100_000,
       classifierMaxChars: 4000,
       classifierTimeoutMs: 1000,
+      ...(sessionTtlMs !== undefined ? { sessionTtlMs } : {}),
       quota: { level: () => 'critical', current: quotaCurrent },
     } as any);
     return { router, store, classifier };
@@ -116,6 +117,19 @@ describe('router fallback-loop stickiness', () => {
     const dec = await router.decide(req({ max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }));
     assert.notEqual(dec.route, 'cursor');
     assert.equal(dec.route, 'primary');
+  });
+
+  it('fallback-loop mark older than the session TTL does not stick (tool continuation)', async () => {
+    const { router } = setup(() => undefined, undefined, 60_000);
+    (router as any).markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'cursor');
+    // Age the mark past the TTL (lazy prune on read, no timers).
+    const entry = (router as any).fallbackLoop.get('s1:main');
+    if (entry && typeof entry === 'object') entry.markedAt = Date.now() - 61_000;
+    else (router as any).fallbackLoop.set('s1:main', { tier: 'cursor', markedAt: Date.now() - 61_000 });
+    const dec = await router.decide(req(toolTurn));
+    assert.notEqual(dec.route, 'cursor');
+    assert.equal(dec.route, 'primary');
+    assert.equal((router as any).fallbackLoop.get('s1:main'), undefined);
   });
 
   it('tool-result continuation sticks to the marked tier without classification', async () => {

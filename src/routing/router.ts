@@ -81,6 +81,8 @@ export interface RouterOptions {
   readonly pressurePolicy?: { readonly minCheapProbability: number; readonly minStandardProbability: number };
   readonly geminiPolicy?: import('../domain/policy.js').GeminiPolicyOptions;
   readonly geminiFromPrimary?: boolean;
+  /** Session TTL: fallback-loop marks older than this are treated as absent. Defaults to the serve.ts session TTL (6h). */
+  readonly sessionTtlMs?: number;
   /** route first open-ended project-state turns to the standard tier */
   readonly readFirstStandard?: boolean;
 }
@@ -104,8 +106,29 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = 
 export class Router {
   private readonly lastRouteWasGemini = new Set<string>();
   private readonly lastServedTier = new Map<string, Tier>();
-  /** Cascade fallback loop: conversation key -> CLI tier that served a turn after Claude rate-limited. */
-  private readonly fallbackLoop = new Map<string, 'cursor' | 'gemini'>();
+  /** Cascade fallback loop: conversation key -> CLI tier + mark time. Entries older than the session TTL are pruned lazily on read/mark (no timers). */
+  private readonly fallbackLoop = new Map<string, { readonly tier: 'cursor' | 'gemini'; markedAt: number }>();
+
+  private fallbackLoopTtlMs(): number {
+    return this.options.sessionTtlMs ?? 6 * 60 * 60 * 1000;
+  }
+
+  private pruneFallbackLoop(now = Date.now()): void {
+    const ttl = this.fallbackLoopTtlMs();
+    for (const [k, e] of this.fallbackLoop) {
+      if (now - e.markedAt > ttl) this.fallbackLoop.delete(k);
+    }
+  }
+
+  private fallbackLoopTier(key: string): 'cursor' | 'gemini' | undefined {
+    const entry = this.fallbackLoop.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.markedAt > this.fallbackLoopTtlMs()) {
+      this.fallbackLoop.delete(key);
+      return undefined;
+    }
+    return entry.tier;
+  }
 
   constructor(
     private readonly classifier: ComplexityClassifier,
@@ -187,7 +210,7 @@ export class Router {
     const humanText = latestHumanText(ctx.body);
     // A quota probe (max_tokens <= 1) is never rerouted: it must not be served by a loop CLI tier.
     const isProbe = typeof ctx.body.max_tokens === 'number' && ctx.body.max_tokens <= 1;
-    const loopTier = this.fallbackLoop.get(key);
+    const loopTier = this.fallbackLoopTier(key);
     const loopActive =
       loopTier && !hasImageDocumentOrToolChoice(ctx.body) && !isProbe ? loopTier : undefined;
     if (loopActive && humanText === undefined) {
@@ -357,7 +380,8 @@ export class Router {
   markFallbackLoop(decision: RouteDecision, served: 'cursor' | 'gemini'): void {
     const key = decision.conversationKey;
     if (!key) return;
-    this.fallbackLoop.set(key, served);
+    this.pruneFallbackLoop();
+    this.fallbackLoop.set(key, { tier: served, markedAt: Date.now() });
     this.lastServedTier.set(key, served);
     if (served === 'gemini') this.lastRouteWasGemini.add(key);
     else this.lastRouteWasGemini.delete(key);

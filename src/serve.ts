@@ -92,6 +92,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
         : {}),
       classifierTimeoutMs: config.classifier.timeoutMs,
       classifierMaxChars: config.classifier.maxChars,
+      sessionTtlMs: config.router.sessionTtlMs,
       ...(quota
         ? {
             quota,

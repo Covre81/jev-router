@@ -81,10 +81,10 @@ async function createTestServer(opts: {
   return { proxy, url: `http://127.0.0.1:${(proxy.server.address() as AddressInfo).port}` };
 }
 
-const rateLimitedPrimary = () =>
+const rateLimitedPrimary = (status = 429) =>
   stub('primary', () => ({
     kind: 'response',
-    status: 429,
+    status,
     headers: { 'content-type': 'application/json', 'x-original': 'yes' },
     body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]),
   }));
@@ -341,6 +341,60 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
       await r3.body.text();
       assert.equal(primary.hits, 1);
       assert.equal(cheap.hits, 2);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('10. primary 529 served by Cursor', async () => {
+    const primary = rateLimitedPrimary(529);
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    try {
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s529');
+      assert.equal(r.statusCode, 200);
+      assert.equal(r.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      const data = (await r.body.json()) as any;
+      assert.equal(data.content[0].text, 'cursor ok');
+      assert.equal(primary.hits, 1);
+      assert.equal(cursor.hits, 1);
+      assert.equal(gemini.hits, 0);
+      assert.equal(cheap.hits, 0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('11. image-content turn skips Cursor and Gemini straight to cheap', async () => {
+    const primary = rateLimitedPrimary();
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    try {
+      const r = await send(
+        url,
+        {
+          model: 'claude',
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: 'what is in this picture?' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+            ],
+          }],
+        },
+        'cascade-s-image',
+      );
+      assert.equal(r.statusCode, 200);
+      assert.equal(r.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
+      const data = (await r.body.json()) as any;
+      assert.equal(data.content[0].text, 'cheap ok');
+      assert.equal(cursor.hits, 0);
+      assert.equal(gemini.hits, 0);
+      assert.equal(cheap.hits, 1);
     } finally {
       await proxy.close();
     }
