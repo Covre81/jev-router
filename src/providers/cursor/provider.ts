@@ -21,6 +21,9 @@ export class CursorCliProvider implements Provider {
 
     const prompt = renderGeminiPrompt(req.body, this.opts.maxPromptChars, { variant: 'cursor' });
     if (!prompt) return { kind: 'unavailable', reason: 'transcript budget exceeded' };
+    // A cut transcript answers without the history; Gemini's budget keeps it whole, so decline and let it take the turn.
+    // ponytail: marker detection; a transcript quoting the marker also declines (costs only a Gemini hop)
+    if (prompt.includes('[earlier conversation omitted]')) return { kind: 'unavailable', reason: 'transcript budget exceeded' };
     // Windows command-line cap: over-budget prompts never spawn (renderGeminiPrompt already enforces maxPromptChars).
     if (prompt.length > this.opts.maxPromptChars) return { kind: 'unavailable', reason: 'transcript budget exceeded' };
 

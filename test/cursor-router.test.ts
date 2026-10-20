@@ -366,4 +366,33 @@ describe('cursor runner/provider units', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('7e. provider: a transcript that would drop history declines without spawning (Gemini keeps it whole)', async () => {
+    const { root } = await fakeCursorRoot();
+    let spawned = 0;
+    try {
+      const spawnFn = () => {
+        spawned++;
+        return fakeChild((child) => {
+          child.stdout.emit('data', line({ type: 'result', subtype: 'success', is_error: false, result: 'cursor answer' }));
+          child.emit('close', 0);
+        });
+      };
+      const p = new CursorCliProvider({ bin: root, model: 'auto', timeoutMs: 1000, maxPromptChars: 2_000, spawnFn } as any);
+      const messages = [
+        { role: 'user', content: 'x'.repeat(3_000) },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'and now?' },
+      ];
+      const cut = await p.send({ body: { model: 'claude', messages } } as any);
+      assert.deepEqual(cut, { kind: 'unavailable', reason: 'transcript budget exceeded' });
+      assert.equal(spawned, 0);
+
+      const whole = await p.send({ body: { model: 'claude', messages: messages.slice(1) } } as any);
+      assert.equal(whole.kind, 'response');
+      assert.equal(spawned, 1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
