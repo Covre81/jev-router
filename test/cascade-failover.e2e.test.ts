@@ -8,7 +8,7 @@ import { Router } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
 import { CircuitBreaker } from '../src/providers/breaker.js';
 import { buildServer } from '../src/proxy/server.js';
-import type { Provider, ProviderResult } from '../src/providers/provider.js';
+import type { Provider, ProviderRequest, ProviderResult } from '../src/providers/provider.js';
 
 const jsonResponse = (text: string, toolUse = false): ProviderResult => ({
   kind: 'response',
@@ -30,13 +30,13 @@ const jsonResponse = (text: string, toolUse = false): ProviderResult => ({
 
 const ORIGINAL_429_BODY = JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: '5h limit hit' } });
 
-function stub(name: string, fn: () => ProviderResult) {
+function stub(name: string, fn: (r: ProviderRequest) => ProviderResult) {
   const p = {
     name,
     hits: 0,
-    async send() {
+    async send(r: ProviderRequest) {
       p.hits++;
-      return fn();
+      return fn(r);
     },
   };
   return p as typeof p & Provider;
@@ -560,6 +560,28 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
       assert.equal(cursor.hits, 0);
       assert.equal(gemini.hits, 0);
       assert.equal(cheap.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('12. Cursor declining an over-budget transcript does not open its breaker', async () => {
+    const primary = rateLimitedPrimary();
+    // Mirrors CursorProvider: a transcript over the command-line budget is declined before spawning.
+    const cursor = stub('cursor', (r) =>
+      JSON.stringify(r.body).length > 5000 ? { kind: 'unavailable', reason: 'transcript budget exceeded' } : jsonResponse('cursor ok'),
+    );
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor, cheap });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const long = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'x'.repeat(6000) }] }, `cascade-long-${i}`);
+        assert.equal(long.headers['x-jev-route'], 'cheap; reason=failover:cursor-unavailable');
+        await long.body.text();
+      }
+      const short = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-short');
+      assert.equal(short.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      await short.body.text();
     } finally {
       await proxy.close();
     }

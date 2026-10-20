@@ -324,7 +324,9 @@ export function buildServer({
           return res;
         }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
-        if (res.reason === 'aborted' || isRoutingMiss) outcome = 'neutral';
+        // Over-budget is a property of the request, not provider health: it must not open the breaker.
+        const overBudget = res.reason === 'transcript budget exceeded';
+        if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
         req.log.warn({ failure: failureCode(res.reason), conversation: decision.conversationKey }, `${tier} provider unavailable`);
         upstreamFailureState = { failure: failureCode(res.reason) };
         const statusMatch = res.reason.match(/^HTTP (\d+)/);
