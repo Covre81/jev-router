@@ -163,6 +163,29 @@ function fakeChild(script: (child: any) => void) {
 const line = (o: unknown) => Buffer.from(JSON.stringify(o) + '\n');
 
 describe('cursor runner/provider units', () => {
+  it('7a2. strips MSYSTEM/EXEPATH so Cursor runs hooks with PowerShell, not Git Bash', async () => {
+    const { root } = await fakeCursorRoot();
+    let seen: any;
+    process.env.MSYSTEM = 'MINGW64';
+    process.env.EXEPATH = 'C:\\Program Files\\Git\\bin';
+    try {
+      const spawnFn = (_bin: string, _args: string[], opts: any) => {
+        seen = opts;
+        return fakeChild((child) => {
+          child.stdout.emit('data', line({ type: 'result', subtype: 'success', is_error: false, result: 'ok' }));
+          child.emit('close', 0);
+        });
+      };
+      await runCursorAgent('p', { bin: root, model: 'auto', timeoutMs: 1000 }, spawnFn as any);
+      assert.ok(!('MSYSTEM' in seen.env));
+      assert.ok(!('EXEPATH' in seen.env));
+    } finally {
+      delete process.env.MSYSTEM;
+      delete process.env.EXEPATH;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('7a. success from stream-json events; strips CURSOR_API_KEY, prompt is last argv', async () => {
     const { root, ver } = await fakeCursorRoot();
     let seen: any;

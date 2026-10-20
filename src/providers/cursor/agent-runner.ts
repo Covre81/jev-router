@@ -86,7 +86,10 @@ export async function runCursorAgent(
     ];
     // Subscription login must win and lives in the real ~/.cursor: keep HOME/USERPROFILE,
     // strip API keys so the child can never bill an API account instead.
-    const STRIPPED_ENV = new Set(['CURSOR_API_KEY', 'ANTHROPIC_API_KEY', 'TYPESAFE_API_KEY', 'PROXY_AUTH_TOKEN', 'CHEAP_API_KEY']);
+    // MSYSTEM/EXEPATH (inherited from Git Bash) make Cursor pick a bash executor while it always
+    // builds hook commands in PowerShell syntax on Windows: every hook then fails with
+    // "eval: syntax error near unexpected token '&'".
+    const STRIPPED_ENV = new Set(['CURSOR_API_KEY', 'ANTHROPIC_API_KEY', 'TYPESAFE_API_KEY', 'PROXY_AUTH_TOKEN', 'CHEAP_API_KEY', 'MSYSTEM', 'EXEPATH']);
     const childEnv: NodeJS.ProcessEnv = { ...process.env };
     for (const key of Object.keys(childEnv)) {
       if (STRIPPED_ENV.has(key.toUpperCase())) delete childEnv[key];
