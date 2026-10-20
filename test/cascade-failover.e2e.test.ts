@@ -338,6 +338,86 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
     }
   });
 
+  it('8b. sticky primary turn: second human turn classified risky at cascade time => 429, no cascade hits', async () => {
+    let limited = false;
+    const primary = stub('primary', () =>
+      limited
+        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json', 'x-original': 'yes' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
+        : jsonResponse('claude ok'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, classification: cls });
+    try {
+      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-risk-sticky');
+      assert.equal(r1.statusCode, 200);
+      await r1.body.text();
+
+      Object.assign(cls, {
+        risk: 0.95,
+        riskScores: { security_sensitive: 0.95, destructive_or_production: 0, requires_inspection: 0 },
+      });
+      limited = true;
+      const r2 = await send(url, {
+        model: 'claude',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: 'claude ok' },
+          { role: 'user', content: 'delete the production database' },
+        ],
+      }, 'cascade-s-risk-sticky');
+      assert.equal(r2.statusCode, 429);
+      assert.equal(await r2.body.text(), ORIGINAL_429_BODY);
+      assert.equal(primary.hits, 2);
+      assert.equal(cursor.hits, 0);
+      assert.equal(gemini.hits, 0);
+      assert.equal(cheap.hits, 0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('8c. tool continuation: driving human text classified risky at cascade time => 429, no cascade hits', async () => {
+    let limited = false;
+    const primary = stub('primary', () =>
+      limited
+        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json', 'x-original': 'yes' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
+        : jsonResponse('claude ok'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, classification: cls });
+    try {
+      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'delete the production database' }] }, 'cascade-s-risk-tool');
+      assert.equal(r1.statusCode, 200);
+      await r1.body.text();
+
+      Object.assign(cls, {
+        risk: 0.95,
+        riskScores: { security_sensitive: 0, destructive_or_production: 0.95, requires_inspection: 0 },
+      });
+      limited = true;
+      const r2 = await send(url, {
+        model: 'claude',
+        messages: [
+          { role: 'user', content: 'delete the production database' },
+          { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
+        ],
+      }, 'cascade-s-risk-tool');
+      assert.equal(r2.statusCode, 429);
+      assert.equal(await r2.body.text(), ORIGINAL_429_BODY);
+      assert.equal(primary.hits, 2);
+      assert.equal(cursor.hits, 0);
+      assert.equal(gemini.hits, 0);
+      assert.equal(cheap.hits, 0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   it('9. cursor->cheap advance records trivial: continuation stays on cheap, primary not re-hit', async () => {
     const primary = rateLimitedPrimary();
     const cursor: any = {

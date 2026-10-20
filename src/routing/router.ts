@@ -5,6 +5,7 @@ import {
   conversationFingerprint,
   estimateInputTokens,
   isFreshConversation,
+  lastHumanText,
   latestHumanText,
   hasImageDocumentOrToolChoice,
   type MessagesBody,
@@ -368,6 +369,26 @@ export class Router {
     const next = stickyTier(sticky, proposed);
     const reason: RouteReason = next === sticky ? 'sticky' : next === 'standard' ? 'escalated:standard' : 'escalated';
     return resolve(next, reason, extra);
+  }
+
+  /** Risk check for a turn about to leave Claude through the cascade. Classifier failure counts as risky (fail toward primary). */
+  async cascadeRiskVeto(body: MessagesBody): Promise<boolean> {
+    const text = lastHumanText(body);
+    if (text === undefined) return false;
+    try {
+      const distribution = await this.classifier.classify(
+        {
+          text: text.slice(0, this.options.classifierMaxChars),
+          turnCount: body.messages.length,
+          toolCount: Array.isArray(body['tools']) ? body['tools'].length : 0,
+          estimatedInputTokens: 0,
+        },
+        AbortSignal.timeout(this.options.classifierTimeoutMs),
+      );
+      return hardRiskVeto(distribution);
+    } catch {
+      return true;
+    }
   }
 
   /** The cheap provider could not serve this conversation: keep it on the primary from now on. */

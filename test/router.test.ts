@@ -4,7 +4,7 @@ import type { ClassificationInput, ComplexityClassifier } from '../src/classifie
 import type { ComplexityDistribution } from '../src/domain/complexity.js';
 import type { Tier } from '../src/domain/policy.js';
 import type { QuotaLevel } from '../src/quota.js';
-import { MessagesBody } from '../src/routing/messages-body.js';
+import { MessagesBody, lastHumanText } from '../src/routing/messages-body.js';
 import { Router, type RequestContext } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
 
@@ -298,5 +298,69 @@ describe('Router under quota pressure', () => {
   it('behaves as before without quota routing (QUOTA_ROUTING=false)', async () => {
     const { router } = quotaSetup(() => BORDERLINE, undefined);
     assert.equal((await router.decide(ctx([user('rename x')]))).route, 'primary');
+  });
+});
+
+describe('lastHumanText', () => {
+  const body = (messages: unknown[]) => MessagesBody.parse({ model: 'claude-opus-5-5', messages });
+
+  it('returns the most recent human text', () => {
+    assert.equal(lastHumanText(body([user('first'), assistantText, user('second')])), 'second');
+  });
+
+  it('falls back to the human request driving a tool loop', () => {
+    assert.equal(
+      lastHumanText(body([user('delete the production database'), assistantToolUse, toolResult])),
+      'delete the production database',
+    );
+  });
+
+  it('skips a trailing user turn with no human text', () => {
+    assert.equal(lastHumanText(body([user('do X'), assistantText, user('<system-reminder>only</system-reminder>')])), 'do X');
+  });
+
+  it('returns undefined when there is no human text', () => {
+    assert.equal(lastHumanText(body([assistantText, toolResult])), undefined);
+  });
+});
+
+describe('Router.cascadeRiskVeto', () => {
+  const body = (messages: unknown[]) => MessagesBody.parse({ model: 'claude-opus-5-5', messages });
+  const RISKY_CLS = {
+    ...STRUCTURAL,
+    risk: 0.95,
+    riskScores: { security_sensitive: 0.95, destructive_or_production: 0, requires_inspection: 0 },
+  };
+  const BENIGN_CLS = { ...STRUCTURAL, risk: 0.1 };
+
+  it('vetoes when the classifier scores the last human text risky', async () => {
+    const { router, classifier } = setup(() => RISKY_CLS);
+    assert.equal(await router.cascadeRiskVeto(body([user('delete the production database')])), true);
+    assert.equal(classifier.calls[0]?.text, 'delete the production database');
+  });
+
+  it('does not veto a benign turn', async () => {
+    const { router } = setup(() => BENIGN_CLS);
+    assert.equal(await router.cascadeRiskVeto(body([user('rename x')])), false);
+  });
+
+  it('classifies the driving human text of a tool continuation', async () => {
+    const { router, classifier } = setup(() => RISKY_CLS);
+    assert.equal(
+      await router.cascadeRiskVeto(body([user('put the Stripe key in the code'), assistantToolUse, toolResult])),
+      true,
+    );
+    assert.equal(classifier.calls[0]?.text, 'put the Stripe key in the code');
+  });
+
+  it('returns false without classifying when there is no human text', async () => {
+    const { router, classifier } = setup(() => RISKY_CLS);
+    assert.equal(await router.cascadeRiskVeto(body([assistantText, toolResult])), false);
+    assert.equal(classifier.calls.length, 0);
+  });
+
+  it('counts classifier failure as risky (fail toward primary)', async () => {
+    const { router } = setup(() => new Error('timeout'));
+    assert.equal(await router.cascadeRiskVeto(body([user('anything')])), true);
   });
 });

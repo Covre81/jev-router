@@ -493,11 +493,13 @@ export function buildServer({
     const skipCli = hasImageDocumentOrToolChoice(base.body!);
     const primaryFailure = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
 
-    // A hard risk veto wins over the cascade: a classified risky turn must
-    // not be served by Cursor/Gemini/cheap just because Claude rate-limited.
+    // A hard risk veto wins over the cascade: a risky turn must not be
+    // served by Cursor/Gemini/cheap just because Claude rate-limited.
     // Relay the original Anthropic error verbatim (all-tiers-down path).
-    // Decisions without a distribution (sticky/unclassified) cascade as before.
-    if (decision.distribution && hardRiskVeto(decision.distribution)) {
+    // Unclassified turns (sticky primary, tool continuations) are classified
+    // here, on their last human text, before they can leave Claude.
+    const vetoed = decision.distribution ? hardRiskVeto(decision.distribution) : await router.cascadeRiskVeto(base.body!);
+    if (vetoed) {
       upstreamFailureState = primaryFailure;
       const original: ProviderResult = { ...primary, body: Readable.from([errorBody]) };
       return relay(reply, original, decision, req, exchange('primary'));

@@ -70,6 +70,22 @@ export function latestHumanText(body: MessagesBody): string | undefined {
   return humanTextOf(last);
 }
 
+/**
+ * Human text driving the conversation: the most recent `user` turn without a
+ * tool_result and with non-empty text. Unlike `latestHumanText`, this scans
+ * past tool-result continuations to the human request driving the tool loop.
+ */
+export function lastHumanText(body: MessagesBody): string | undefined {
+  const all = turns(body);
+  for (let i = all.length - 1; i >= 0; i--) {
+    const turn = all[i]!;
+    if (turn.role !== 'user' || hasToolResult(turn)) continue;
+    const text = humanTextOf(turn);
+    if (text) return text;
+  }
+  return undefined;
+}
+
 export function isFreshConversation(body: MessagesBody): boolean {
   return turns(body).length === 1;
 }
