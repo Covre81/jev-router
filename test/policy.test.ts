@@ -109,6 +109,7 @@ describe('stickyTier', () => {
     assert.equal(stickyTier('standard', 'gemini'), 'standard');
     assert.equal(stickyTier('gemini', 'primary'), 'primary');
     assert.equal(stickyTier('gemini', 'gemini'), 'primary');
+    assert.equal(stickyTier('cursor', 'cursor'), 'primary');
   });
 });
 

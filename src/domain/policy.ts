@@ -74,7 +74,7 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = 
  * would throw away the cache of the model the conversation moved up to.
  */
 export function stickyTier(current: Tier, proposed: Tier): Tier {
-  if (current === 'gemini' && proposed === 'gemini') return 'primary';
+  if ((current === 'gemini' || current === 'cursor') && proposed === current) return 'primary';
   if (current === 'gemini' || current === 'cursor') return proposed === 'gemini' || proposed === 'cursor' ? current : proposed;
   if (proposed === 'gemini' || proposed === 'cursor') return current;
   return TIER_RANK[proposed] > TIER_RANK[current] ? proposed : current;
