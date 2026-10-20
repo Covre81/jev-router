@@ -46,6 +46,77 @@ export function parseGeminiToolCalls(rawText: string): {
   };
 }
 
+/** Anthropic JSON/SSE synthesis shared by the CLI-backed tiers (Gemini, Cursor). */
+export function anthropicResponseFromCliText(opts: {
+  readonly rawText: string;
+  readonly usage: { readonly inputTokens: number; readonly outputTokens: number };
+  readonly model: string;
+  readonly stream: boolean | undefined;
+}): ProviderResult {
+  const rawText = opts.rawText.trim();
+  const { text, toolCalls } = parseGeminiToolCalls(rawText);
+  if (toolCalls.length === 0 && (text.startsWith('JEV_NEEDS_TOOLS') || text === 'JEV_NEEDS_TOOLS')) {
+    return { kind: 'unavailable', reason: 'model asked for tools' };
+  }
+  const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
+  const usage = opts.usage;
+  const msgId = `msg_jev_${randomUUID()}`;
+  const headers: Record<string, string> = {
+    'content-type': opts.stream ? 'text/event-stream' : 'application/json',
+  };
+  if (opts.stream) {
+    headers['cache-control'] = 'no-cache';
+    const model = opts.model;
+    async function* generateStream() {
+      yield sseEvent('message_start', {
+        message: {
+          id: msgId,
+          type: 'message',
+          role: 'assistant',
+          model,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: usage.inputTokens, output_tokens: 0 },
+        },
+      });
+      let index = 0;
+      if (text.length > 0 || toolCalls.length === 0) {
+        yield sseEvent('content_block_start', { index, content_block: { type: 'text', text: '' } });
+        const chunkLen = 2000;
+        for (let i = 0; i < text.length; i += chunkLen) {
+          yield sseEvent('content_block_delta', { index, delta: { type: 'text_delta', text: text.slice(i, i + chunkLen) } });
+        }
+        yield sseEvent('content_block_stop', { index });
+        index++;
+      }
+      for (const call of toolCalls) {
+        yield sseEvent('content_block_start', { index, content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} } });
+        yield sseEvent('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(call.input) } });
+        yield sseEvent('content_block_stop', { index });
+        index++;
+      }
+      yield sseEvent('message_delta', { delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.outputTokens } });
+      yield sseEvent('message_stop', {});
+    }
+    return { kind: 'response', status: 200, headers, body: Readable.from(generateStream()) };
+  }
+  const content: Array<Record<string, unknown>> = [];
+  if (text.length > 0 || toolCalls.length === 0) content.push({ type: 'text', text });
+  for (const call of toolCalls) content.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
+  const responseJson = {
+    id: msgId,
+    type: 'message',
+    role: 'assistant',
+    model: opts.model,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens },
+  };
+  return { kind: 'response', status: 200, headers, body: Readable.from([JSON.stringify(responseJson)]) };
+}
+
 export class GeminiCliProvider implements Provider {
   readonly name = 'gemini-cli';
 
@@ -84,120 +155,7 @@ export class GeminiCliProvider implements Provider {
       return { kind: 'unavailable', reason: res.reason };
     }
 
-    const rawText = res.text.trim();
-    const { text, toolCalls } = parseGeminiToolCalls(rawText);
-    if (toolCalls.length === 0 && (text.startsWith('JEV_NEEDS_TOOLS') || text === 'JEV_NEEDS_TOOLS')) {
-      return { kind: 'unavailable', reason: 'model asked for tools' };
-    }
-
-    const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
-    const usage = res.usage;
-    const msgId = `msg_jev_${randomUUID()}`;
-
-    const headers: Record<string, string> = {
-      'content-type': req.body.stream ? 'text/event-stream' : 'application/json'
-    };
-
-    if (req.body.stream) {
-      headers['cache-control'] = 'no-cache';
-      const model = this.opts.model;
-
-      async function* generateStream() {
-        yield sseEvent('message_start', {
-          message: {
-            id: msgId,
-            type: 'message',
-            role: 'assistant',
-            model: model,
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: usage.inputTokens, output_tokens: 0 }
-          }
-        });
-
-        let index = 0;
-
-        if (text.length > 0 || toolCalls.length === 0) {
-          yield sseEvent('content_block_start', {
-            index,
-            content_block: { type: 'text', text: '' }
-          });
-
-          const chunkLen = 2000;
-          for (let i = 0; i < text.length; i += chunkLen) {
-            yield sseEvent('content_block_delta', {
-              index,
-              delta: { type: 'text_delta', text: text.slice(i, i + chunkLen) }
-            });
-          }
-
-          yield sseEvent('content_block_stop', { index });
-          index++;
-        }
-
-        for (const call of toolCalls) {
-          yield sseEvent('content_block_start', {
-            index,
-            content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} }
-          });
-          yield sseEvent('content_block_delta', {
-            index,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(call.input) }
-          });
-          yield sseEvent('content_block_stop', { index });
-          index++;
-        }
-
-        yield sseEvent('message_delta', {
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: usage.outputTokens }
-        });
-
-        yield sseEvent('message_stop', {});
-      }
-
-      return {
-        kind: 'response',
-        status: 200,
-        headers,
-        body: Readable.from(generateStream())
-      };
-    } else {
-      const content: Array<Record<string, unknown>> = [];
-      if (text.length > 0 || toolCalls.length === 0) {
-        content.push({ type: 'text', text });
-      }
-      for (const call of toolCalls) {
-        content.push({
-          type: 'tool_use',
-          id: call.id,
-          name: call.name,
-          input: call.input,
-        });
-      }
-
-      const responseJson = {
-        id: msgId,
-        type: 'message',
-        role: 'assistant',
-        model: this.opts.model,
-        content,
-        stop_reason: stopReason,
-        stop_sequence: null,
-        usage: {
-          input_tokens: res.usage.inputTokens,
-          output_tokens: res.usage.outputTokens
-        }
-      };
-
-      return {
-        kind: 'response',
-        status: 200,
-        headers,
-        body: Readable.from([JSON.stringify(responseJson)])
-      };
-    }
+    return anthropicResponseFromCliText({ rawText: res.text, usage: res.usage, model: this.opts.model, stream: (req.body as { stream?: unknown }).stream === true });
   }
 }
 

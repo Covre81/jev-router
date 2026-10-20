@@ -26,7 +26,7 @@ export interface JevDecision {
   readonly textOnly?: number | null;
 }
 
-export type FinalProvider = 'anthropic' | 'openai' | 'gemini';
+export type FinalProvider = 'anthropic' | 'openai' | 'gemini' | 'cursor';
 
 /**
  * Outcome of the exchange as seen by the client:

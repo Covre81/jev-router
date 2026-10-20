@@ -5,14 +5,14 @@ import type { ComplexityDistribution } from './complexity.js';
  *   cheap   — an OpenAI-compatible provider (Groq, OpenRouter, …), billed per token
  *   primary — Anthropic, the quota reserved for heavy lifting
  */
-export type Route = 'cheap' | 'gemini' | 'primary';
+export type Route = 'cheap' | 'gemini' | 'cursor' | 'primary';
 
 /**
  * Which model serves a conversation. `trivial` and `standard` are both the
  * cheap route (same OpenAI-compatible provider, different model); `primary`
  * is Anthropic. Ordered: a conversation's tier only moves up.
  */
-export type Tier = 'trivial' | 'standard' | 'gemini' | 'primary';
+export type Tier = 'trivial' | 'standard' | 'gemini' | 'cursor' | 'primary';
 
 export interface PolicyOptions {
   /** Minimum P(simple) for the trivial tier (the small cheap model). */
@@ -46,10 +46,7 @@ export function selectTier(
   d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
   options: PolicyOptions,
 ): Tier {
-  const hardRisk = d.riskScores
-    ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
-    : (d.risk ?? 0);
-  if (hardRisk >= MAX_CHEAP_RISK) return 'primary';
+  if (hardRiskVeto(d)) return 'primary';
 
   const inspectionVeto = (d.risk ?? 0) >= MAX_CHEAP_RISK;
   if (!inspectionVeto && d.simple >= options.minCheapProbability) return 'trivial';
@@ -67,9 +64,10 @@ export function selectRoute(d: ComplexityDistribution & { readonly risk?: number
   return tierRoute(selectTier(d, options));
 }
 
-export const tierRoute = (tier: Tier): Route => (tier === 'primary' ? 'primary' : tier === 'gemini' ? 'gemini' : 'cheap');
+export const tierRoute = (tier: Tier): Route =>
+  tier === 'primary' ? 'primary' : tier === 'gemini' ? 'gemini' : tier === 'cursor' ? 'cursor' : 'cheap';
 
-const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini'>, number>> = { trivial: 0, standard: 1, primary: 2 };
+const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = { trivial: 0, standard: 1, primary: 2 };
 
 /**
  * Escalate-only, across tiers: trivial → standard → primary. Bouncing down
@@ -77,8 +75,8 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini'>, number>> = { trivial: 
  */
 export function stickyTier(current: Tier, proposed: Tier): Tier {
   if (current === 'gemini' && proposed === 'gemini') return 'primary';
-  if (current === 'gemini') return proposed;
-  if (proposed === 'gemini') return current;
+  if (current === 'gemini' || current === 'cursor') return proposed === 'gemini' || proposed === 'cursor' ? current : proposed;
+  if (proposed === 'gemini' || proposed === 'cursor') return current;
   return TIER_RANK[proposed] > TIER_RANK[current] ? proposed : current;
 }
 
@@ -90,6 +88,16 @@ export function stickyTier(current: Tier, proposed: Tier): Tier {
  */
 // ponytail: fixed bar, make it a PolicyOptions field if the eval ever puts cases near it
 const MAX_CHEAP_RISK = 0.5;
+
+/** Same hard-risk rule selectTier uses: security/destructive scores veto every non-primary route. */
+export function hardRiskVeto(
+  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
+): boolean {
+  const hardRisk = d.riskScores
+    ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
+    : (d.risk ?? 0);
+  return hardRisk >= MAX_CHEAP_RISK;
+}
 
 /**
  * Escalate-only: once a conversation reaches the primary provider it stays

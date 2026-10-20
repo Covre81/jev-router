@@ -101,7 +101,7 @@ export function computeNetCost(rows: readonly CostRow[], pricing: Pricing): NetC
     if (row.tokensIn === null && row.outcome === 'ok') rowsWithoutUsage++;
     jevUsd += ((row.jevTokensIn ?? 0) * pricing.jev.input + (row.jevTokensOut ?? 0) * pricing.jev.output) / PER_MTOK;
 
-    if (row.finalProvider === 'openai' || row.finalProvider === 'gemini') {
+    if (row.finalProvider === 'openai' || row.finalProvider === 'gemini' || row.finalProvider === 'cursor') {
       const actual = row.finalProvider === 'openai' ? ((row.tokensIn ?? 0) * pricing.cheap.input + (row.tokensOut ?? 0) * pricing.cheap.output) / PER_MTOK : 0;
       cheapUsd += actual;
       if (row.outcome === 'ok') {
@@ -125,7 +125,7 @@ export function computeNetCost(rows: readonly CostRow[], pricing: Pricing): NetC
           (row.tokensOut ?? 0) * p.output) /
         PER_MTOK;
       anthropicUsd += actual;
-      if ((prev?.finalProvider === 'openai' || prev?.finalProvider === 'gemini') && row.tokensIn !== null) {
+      if ((prev?.finalProvider === 'openai' || prev?.finalProvider === 'gemini' || prev?.finalProvider === 'cursor') && row.tokensIn !== null) {
         const counterfactual = Math.min(actual, warmAnthropicUsd(row, prev));
         baselineUsd += counterfactual;
         cachePenaltyUsd += actual - counterfactual;

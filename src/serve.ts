@@ -19,6 +19,7 @@ import { noopTelemetry, SqliteTelemetry, type TelemetrySink } from './telemetry/
 
 import { ensureAgyHome } from './providers/gemini/isolation.js';
 import { GeminiCliProvider } from './providers/gemini/provider.js';
+import { CursorCliProvider } from './providers/cursor/provider.js';
 import { CircuitBreaker } from './providers/gemini/breaker.js';
 
 // ponytail: fixed cap, one entry per live conversation. An evicted cheap
@@ -117,6 +118,9 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
   const geminiBreaker = geminiConfig
     ? new CircuitBreaker(geminiConfig.breakerFailures, geminiConfig.breakerCooldownMs, geminiConfig.maxConcurrency)
     : undefined;
+  const cursorBreaker = config.cursor
+    ? new CircuitBreaker(config.cursor.breakerFailures, config.cursor.breakerCooldownMs, config.cursor.maxConcurrency)
+    : undefined;
 
   const providers = {
     primary: new AnthropicProvider(config.primary),
@@ -127,6 +131,9 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       : {}),
     ...(geminiConfig
       ? { gemini: new GeminiCliProvider(geminiConfig) }
+      : {}),
+    ...(config.cursor
+      ? { cursor: new CursorCliProvider(config.cursor) }
       : {}),
   };
 
@@ -149,6 +156,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
     ...(build ? { build } : {}),
     ...(quota ? { quota } : {}),
     ...(geminiBreaker ? { geminiBreaker } : {}),
+    ...(cursorBreaker ? { cursorBreaker } : {}),
   });
   logTelemetryError = (err) => app.log.error({ err }, 'telemetry write failed');
   logCheapState = (state) => app.log[state === 'down' ? 'warn' : 'info']({ cheap: state }, 'cheap provider health changed');
@@ -175,6 +183,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       cheap: `${config.cheap.baseUrl} (${config.cheap.model})`,
       standard: config.cheapStandard?.model ?? 'off',
       gemini: geminiConfig ? geminiConfig.model : 'off',
+      cursor: config.cursor ? config.cursor.model : 'off',
       telemetry: config.telemetry.dbPath ?? 'disabled',
     },
     'jev-router ready',

@@ -85,6 +85,14 @@ const Env = z
     GEMINI_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     GEMINI_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
     GEMINI_TIER_HOME: z.string().optional(), // defaults to <jevHome()>/agy-home in loadConfig
+    CURSOR_TIER: z.enum(['off', 'on']).default('off'),
+    CURSOR_TIER_BIN: z.string().optional(),
+    CURSOR_TIER_MODEL: z.string().default('auto'),
+    CURSOR_TIER_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+    CURSOR_TIER_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(24_000),
+    CURSOR_TIER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
+    CURSOR_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
+    CURSOR_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
   })
   .superRefine((env, ctx) => {
     if (env.QUOTA_CRITICAL < env.QUOTA_PRESSURE) {
@@ -143,6 +151,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   } else {
     geminiBin = expandEnv(geminiBin, env);
   }
+
+  const cursorBin = e.CURSOR_TIER_BIN
+    ? expandEnv(e.CURSOR_TIER_BIN, env)
+    : join(env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'cursor-agent');
 
   return {
     host: e.HOST,
@@ -219,6 +231,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
             breakerFailures: e.GEMINI_TIER_BREAKER_FAILURES,
             breakerCooldownMs: e.GEMINI_TIER_BREAKER_COOLDOWN_MS,
             home: e.GEMINI_TIER_HOME ?? join(jevHome(env), 'agy-home'),
+          },
+    cursor:
+      e.CURSOR_TIER === 'off'
+        ? undefined
+        : {
+            bin: cursorBin,
+            model: e.CURSOR_TIER_MODEL,
+            timeoutMs: e.CURSOR_TIER_TIMEOUT_MS,
+            maxPromptChars: e.CURSOR_TIER_MAX_PROMPT_CHARS,
+            maxConcurrency: e.CURSOR_TIER_MAX_CONCURRENCY,
+            breakerFailures: e.CURSOR_TIER_BREAKER_FAILURES,
+            breakerCooldownMs: e.CURSOR_TIER_BREAKER_COOLDOWN_MS,
           },
     // dbPath is undefined when telemetry is disabled.
     telemetry: { dbPath: e.TELEMETRY_ENABLED ? (e.TELEMETRY_DB_PATH ?? defaultTelemetryDbPath(env)) : undefined, diagnostics: e.TELEMETRY_DIAGNOSTICS },

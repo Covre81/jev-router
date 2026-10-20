@@ -4,12 +4,12 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type { Dispatcher } from 'undici';
 import type { BuildInfo } from '../build-info.js';
 import type { Config } from '../config.js';
-import type { Route, Tier } from '../domain/policy.js';
+import { hardRiskVeto, type Route, type Tier } from '../domain/policy.js';
 import type { CheapState } from '../providers/cheap-health.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
-import { latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
+import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
 import { needsReadFirstHint, withReadFirstHint, needsReadFirstFollowup, READ_FIRST_FOLLOWUP } from '../routing/read-first-hint.js';
 import type { RouteDecision, Router } from '../routing/router.js';
 import { auditExchange, auditFailure, type ExchangeContext } from '../telemetry/audit.js';
@@ -20,7 +20,7 @@ export interface ServerDeps {
   readonly config: Config;
   readonly router: Router;
   /** `standard` serves the standard tier; without it that tier falls back to `cheap`. */
-  readonly providers: Readonly<Record<'cheap' | 'primary', Provider>> & { readonly standard?: Provider | undefined; readonly gemini?: Provider | undefined };
+  readonly providers: Readonly<Record<'cheap' | 'primary', Provider>> & { readonly standard?: Provider | undefined; readonly gemini?: Provider | undefined; readonly cursor?: Provider | undefined };
   readonly telemetry?: TelemetrySink;
   /** Live cheap-provider health; absent = never checked ('unknown'). */
   readonly cheapHealth?: { readonly state: CheapState };
@@ -29,6 +29,7 @@ export interface ServerDeps {
   /** Fed from every Anthropic response's rate-limit headers; absent = quota routing off. */
   readonly quota?: QuotaStore;
   readonly geminiBreaker?: import('../providers/gemini/breaker.js').CircuitBreaker;
+  readonly cursorBreaker?: import('../providers/gemini/breaker.js').CircuitBreaker;
 }
 
 /** Primary statuses that mean "no quota/capacity right now" (opt-in failover to cheap). */
@@ -80,6 +81,7 @@ export function buildServer({
   build,
   quota,
   geminiBreaker,
+  cursorBreaker,
 }: ServerDeps): FastifyInstance {
   const startedAt = new Date().toISOString();
 
@@ -140,6 +142,7 @@ export function buildServer({
     cheap: cheapHealth?.state ?? 'unknown',
     quota: quota?.current() ? { ...quota.current(), level: quota.level() } : null,
     gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
+    cursor: config.cursor ? { model: config.cursor.model, breaker: cursorBreaker?.state, inFlight: cursorBreaker?.inFlight } : null,
   }));
   // Why the main loop's last answer came from where it did: the session-telemetry mod shows it on a model switch.
   const lastRoutes = new Map<string, { route: string; reason: string; at: string }>();
@@ -287,7 +290,7 @@ export function buildServer({
         startedAtMs,
         humanText: latestHumanText(base.body!),
         requestClass: single(req.headers, 'x-claude-code-request-class'),
-        model: route === 'primary' ? base.body!.model : (route === 'gemini' ? config.gemini?.model : (modelOverride ?? cheapModel)),
+        model: route === 'primary' ? base.body!.model : route === 'gemini' ? config.gemini?.model : route === 'cursor' ? config.cursor?.model : (modelOverride ?? cheapModel),
         requestedModel: base.body!.model,
         toolsOffered: Array.isArray(base.body!['tools']) ? base.body!['tools'].length : 0,
         quotaUtilization: quota?.current()?.utilization,
@@ -295,6 +298,64 @@ export function buildServer({
         upstream: upstreamFailureState,
       };
     };
+
+    type CliTier = 'cursor' | 'gemini';
+    /** One breaker-gated attempt on a CLI tier; undefined = unavailable/skipped, caller advances the cascade. */
+    const tryCliTier = async (tier: CliTier, r: ProviderRequest): Promise<ProviderResult | undefined> => {
+      const provider = tier === 'cursor' ? providers.cursor : providers.gemini;
+      const breaker = tier === 'cursor' ? cursorBreaker : geminiBreaker;
+      if (!provider || !breaker || breaker.state === 'open') return undefined;
+      if (!breaker.acquire()) return undefined;
+      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
+      try {
+        let res: ProviderResult;
+        try {
+          res = await provider.send(r);
+        } catch (err) {
+          // A throwing provider is just unavailable: advance the cascade.
+          // Log only the failure code, never raw reason/error text.
+          const failure = failureCode(err instanceof Error ? err.message : String(err));
+          req.log.warn({ failure, conversation: decision.conversationKey }, `${tier} provider unavailable`);
+          upstreamFailureState = { failure };
+          return undefined;
+        }
+        if (res.kind === 'response') {
+          outcome = 'success';
+          return res;
+        }
+        const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
+        if (res.reason === 'aborted' || isRoutingMiss) outcome = 'neutral';
+        req.log.warn({ failure: failureCode(res.reason), conversation: decision.conversationKey }, `${tier} provider unavailable`);
+        upstreamFailureState = { failure: failureCode(res.reason) };
+        const statusMatch = res.reason.match(/^HTTP (\d+)/);
+        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
+        return undefined;
+      } finally {
+        breaker.release(outcome);
+      }
+    };
+
+    if (decision.route === 'cursor') {
+      const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('cursor', activeBase);
+      if (cursorRes) return relay(reply, cursorRes, decision, req, exchange('cursor'));
+
+      // Cascade advance from a fallback-loop continuation: Cursor -> Gemini -> cheap -> primary (one-off, never pinned).
+      const geminiRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('gemini', activeBase);
+      if (geminiRes) {
+        router.markFallbackLoop(decision, 'gemini');
+        const routeDec: RouteDecision = { ...decision, route: 'gemini', tier: 'gemini', reason: 'failover:cursor-unavailable', fallbackLoop: 'gemini' };
+        return relay(reply, geminiRes, routeDec, req, exchange('gemini'));
+      }
+      const cheapRes = await doSendCheapWithRetry(cheapProvider, cheapReq);
+      if (cheapRes.kind === 'response') {
+        router.useTrivial(decision);
+        const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason: 'failover:gemini-unavailable' };
+        return relay(reply, cheapRes, routeDec, req, exchange('cheap'));
+      }
+      router.clearFallbackLoop(decision, 'primary');
+      const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
+      return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+    }
 
     if (decision.route === 'gemini') {
       const fallbackToPrimary = async (reason: import('../routing/router.js').RouteReason) => {
@@ -305,6 +366,19 @@ export function buildServer({
       };
 
       const doFallback = async (reason: import('../routing/router.js').RouteReason) => {
+        if (decision.fallbackLoop) {
+          // Cascade continuation: Gemini -> cheap -> primary one-off (never pinToPrimary from a cascade continuation).
+          const resCheap = await doSendCheapWithRetry(cheapProvider, cheapReq);
+          if (resCheap.kind === 'response') {
+            router.useTrivial(decision);
+            const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason };
+            return relay(reply, resCheap, routeDec, req, exchange('cheap'));
+          }
+          router.clearFallbackLoop(decision, 'primary');
+          const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
+          return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+        }
+
         if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
           return fallbackToPrimary(reason);
         }
@@ -403,18 +477,68 @@ export function buildServer({
     }
 
     const quotaHeaderNames = rateLimitHeaderNames(primary.headers);
-    req.log.warn({ status: primary.status, quotaHeaderNames, conversation: decision.conversationKey }, 'primary rate-limited, failing over to cheap');
+    req.log.warn({ status: primary.status, quotaHeaderNames, conversation: decision.conversationKey }, 'primary rate-limited, failing over (cascade Cursor -> Gemini -> cheap)');
 
-    // Quota failover: hold the (small) error body so it can still be relayed
-    // verbatim if the cheap provider cannot take the request either.
+    // Cascade failover: hold the (small) error body so it can still be relayed
+    // verbatim if no cascade tier can take the request either. One-shot: these
+    // attempts never re-enter this tail.
     const errorBody = Buffer.concat(await primary.body.toArray());
+    const skipCli = hasImageDocumentOrToolChoice(base.body!);
+    const primaryFailure = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
+
+    // A hard risk veto wins over the cascade: a classified risky turn must
+    // not be served by Cursor/Gemini/cheap just because Claude rate-limited.
+    // Relay the original Anthropic error verbatim (all-tiers-down path).
+    // Decisions without a distribution (sticky/unclassified) cascade as before.
+    if (decision.distribution && hardRiskVeto(decision.distribution)) {
+      upstreamFailureState = primaryFailure;
+      const original: ProviderResult = { ...primary, body: Readable.from([errorBody]) };
+      return relay(reply, original, decision, req, exchange('primary'));
+    }
+
+    if (!skipCli) {
+      const cursorRes = await tryCliTier('cursor', activeBase);
+      if (cursorRes) {
+        router.markFallbackLoop(decision, 'cursor');
+        upstreamFailureState = primaryFailure;
+        return relay(
+          reply,
+          cursorRes,
+          { ...decision, route: 'cursor', tier: 'cursor', reason: 'failover:primary-rate-limited', fallbackLoop: 'cursor' },
+          req,
+          exchange('cursor'),
+        );
+      }
+    }
+
+    // Gemini counts in the cascade only when the tier is wired in: attempted, or skipped
+    // (breaker open / image guard). Without a Gemini tier, cheap keeps the pre-cascade reason.
+    const geminiAttemptedOrSkipped = providers.gemini !== undefined;
+    if (geminiAttemptedOrSkipped && !skipCli) {
+      const geminiRes = await tryCliTier('gemini', activeBase);
+      if (geminiRes) {
+        router.markFallbackLoop(decision, 'gemini');
+        upstreamFailureState = primaryFailure;
+        return relay(
+          reply,
+          geminiRes,
+          { ...decision, route: 'gemini', tier: 'gemini', reason: 'failover:cursor-unavailable', fallbackLoop: 'gemini' },
+          req,
+          exchange('gemini'),
+        );
+      }
+    }
+
     const cheap = await providers.cheap.send(cheapReq);
     if (cheap.kind === 'response') {
-      upstreamFailureState = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
+      upstreamFailureState = primaryFailure;
+      // Cheap served a cascade turn: record trivial so its tool loop stays on
+      // cheap instead of bouncing off the rate-limited Claude.
+      router.useTrivial(decision);
       return relay(
         reply,
         cheap,
-        { ...decision, route: 'cheap', reason: 'failover:primary-rate-limited' },
+        { ...decision, route: 'cheap', tier: 'trivial', reason: geminiAttemptedOrSkipped ? 'failover:gemini-unavailable' : 'failover:primary-rate-limited' },
         req,
         exchange('cheap'),
       );

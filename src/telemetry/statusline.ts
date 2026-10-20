@@ -154,7 +154,7 @@ export function renderStatusLine({ healthy, staleBuild, cheapDown, last, agents,
   if (staleBuild) parts.push('⚠ build velho');
   if (cheapDown) parts.push('cheap ✗');
   if (last) {
-    const where = last.provider === 'openai' ? 'cheap' : last.provider === 'gemini' ? 'gemini' : 'claude';
+    const where = last.provider === 'openai' ? 'cheap' : last.provider === 'gemini' ? 'gemini' : last.provider === 'cursor' ? 'cursor' : 'claude';
     const why = last.pSimple !== undefined ? `JEV ${last.pSimple.toFixed(2)}` : last.reason;
     parts.push(`last: ${where}${last.model ? ` ${last.model}` : ''} (${why})${last.outcome === 'ok' ? '' : ` ${last.outcome}`}`);
   }

@@ -57,19 +57,28 @@ function renderClientTools(tools: unknown[]): string {
   return lines.length > 1 ? lines.join('\n') + '\n\n' : '';
 }
 
-export function renderGeminiPrompt(body: MessagesBody, maxChars: number): string | undefined {
+export function renderGeminiPrompt(
+  body: MessagesBody,
+  maxChars: number,
+  opts: { readonly variant?: 'gemini' | 'cursor' } = {},
+): string | undefined {
   const rawTools = Array.isArray((body as any).tools) ? ((body as any).tools as unknown[]) : [];
   const toolsSection = rawTools.length > 0 ? renderClientTools(rawTools) : '';
+  const cursor = opts.variant === 'cursor';
 
   const preambleText = toolsSection
     ? 'You are answering ONE turn of a conversation between a developer and a coding assistant.\n' +
-      'CRITICAL RULE FOR TOOLS: Do NOT invoke your built-in platform tools (such as view_file, write_to_file, replace_file_content, run_command, grep_search, find_by_name) directly — direct built-in tool calls are blocked by the sandbox.\n' +
+      (cursor
+        ? 'CRITICAL RULE FOR TOOLS: Do NOT use your own tools — do not read or write files, run commands or browse with them. Any use of your own tools counts as failure.\n'
+        : 'CRITICAL RULE FOR TOOLS: Do NOT invoke your built-in platform tools (such as view_file, write_to_file, replace_file_content, run_command, grep_search, find_by_name) directly — direct built-in tool calls are blocked by the sandbox.\n') +
       'Instead, you have full permission to use the client tools listed under "Available Client Tools" below by emitting one or more XML blocks in your text response using this exact format:\n' +
       '<jev_tool_use>{"name": "ToolName", "input": {"param": "value"}}</jev_tool_use>\n' +
       'When you emit <jev_tool_use>...</jev_tool_use>, the client executes the tool in the real workspace and returns [tool result: ...] in the next turn so you can continue.\n' +
       'If you do not need any tool for this turn, reply normally in the same language the user writes in using Markdown.\n\n' +
       toolsSection
-    : 'You are answering ONE turn of a conversation between a developer and a coding assistant. You have NO tools — do not try to read or write files, run commands or browse (any tool use is blocked and counts as failure). Answer the LAST user message using only the transcript. Reply in the same language the user writes in. Use Markdown. If a correct answer genuinely requires reading files not shown, running commands or editing files, reply with exactly JEV_NEEDS_TOOLS and nothing else.\n\n';
+    : cursor
+      ? 'You are answering ONE turn of a conversation between a developer and a coding assistant. You have NO client tools — do not use your own tools to read or write files, run commands or browse (any use of your own tools counts as failure). Answer the LAST user message using only the transcript. Reply in the same language the user writes in. Use Markdown. If a correct answer genuinely requires reading files not shown, running commands or editing files, reply with exactly JEV_NEEDS_TOOLS and nothing else.\n\n'
+      : 'You are answering ONE turn of a conversation between a developer and a coding assistant. You have NO tools — do not try to read or write files, run commands or browse (any tool use is blocked and counts as failure). Answer the LAST user message using only the transcript. Reply in the same language the user writes in. Use Markdown. If a correct answer genuinely requires reading files not shown, running commands or editing files, reply with exactly JEV_NEEDS_TOOLS and nothing else.\n\n';
 
   const envSection = extractSystemEnv((body as any).system);
 

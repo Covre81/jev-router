@@ -79,9 +79,10 @@ only on work that needs Claude**.
      Claude is re-classified and may go cheap (`quota:reclassified`); it then
      stays there, because going back would rebuild the Claude cache. The
      next structural turn escalates as usual.
-   - When Anthropic answers 429 or 529, the request is retried on the cheap
-     provider (`FAILOVER_ON_PRIMARY_RATE_LIMIT=true`, now the default): a
-     degraded answer instead of a dead session. Session-start quota probes
+   - When Anthropic answers 429 or 529, the request is retried down the
+     failover cascade — Cursor, then Gemini, then the cheap provider
+     (`FAILOVER_ON_PRIMARY_RATE_LIMIT=true`, now the default; see
+     "Failover cascade" below): a degraded answer instead of a dead session. Session-start quota probes
      (max_tokens <= 1) are never rerouted: their 429/529 reaches Claude Code unchanged,
      with its anthropic-ratelimit-* headers, so Claude Code can show its own quota warning.
    - The risk veto (rule 7) is checked before any of this, at every level.
@@ -165,6 +166,14 @@ The router can optionally divert medium-to-hard, text-only turns to Gemini using
 4. Run `jev-router reload` (or restart the task).
 5. Check `/healthz` to verify it shows `gemini`.
 6. Watch `jev-router stats`.
+
+### Failover cascade (Cursor tier)
+
+When Claude answers 429/529 (e.g. the 5-hour session limit), the turn is retried down a cascade instead of dying: **Claude → Cursor → Gemini → cheap**, and only when every tier is down does the original Anthropic error reach the client verbatim. Each failure advances one step; whichever tier serves keeps the tool loop — tool-result continuations stick to that tier without hitting Claude first, a failure there advances to the next tier, and a new human turn stays on the fallback tier only while the binding 5h quota window has not yet reset (after the reset, Claude is retried and a fresh 429 re-enters the cascade). Session-start quota probes (`max_tokens <= 1`) are never rerouted. Turns with images, documents or a forced `tool_choice` skip the CLI tiers straight to cheap.
+
+The Cursor tier is **failover-only** (it is not part of normal JEV routing) and **off by default**. It runs the Cursor CLI (`agent -p --mode ask --trust --output-format stream-json`) as a child process on the user's subscription login. Safety mirrors the Gemini tier: ask mode is read-only but not tool-free, so any `tool_call` started event kills the process tree and counts as a routing miss (`tool attempt: …`); the prompt instructs the model to emit `<jev_tool_use>` blocks for the client tools instead of using its own. The Windows command-line cap limits the rendered prompt to `CURSOR_TIER_MAX_PROMPT_CHARS` (default 24000) — over-budget turns skip Cursor without spawning.
+
+**How to enable:** run `agent login` once, set `CURSOR_TIER=on` in your `.env`, rebuild/reload, and check `/healthz` shows `cursor`. Key settings: `CURSOR_TIER_BIN` (default `%LOCALAPPDATA%\cursor-agent`), `CURSOR_TIER_MODEL=auto`, `CURSOR_TIER_TIMEOUT_MS=180000` (cold CLI latency is high), `CURSOR_TIER_MAX_CONCURRENCY=1`, `CURSOR_TIER_BREAKER_FAILURES=3`, `CURSOR_TIER_BREAKER_COOLDOWN_MS=300000`.
 
 ## Repository structure
 

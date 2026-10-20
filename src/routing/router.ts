@@ -1,6 +1,6 @@
 import type { Classification, ComplexityClassifier } from '../classifier/classifier.js';
 import type { ComplexityDistribution } from '../domain/complexity.js';
-import { selectTier, stickyTier, tierRoute, geminiEligible, type PolicyOptions, type Route, type Tier } from '../domain/policy.js';
+import { selectTier, stickyTier, tierRoute, geminiEligible, hardRiskVeto, type PolicyOptions, type Route, type Tier } from '../domain/policy.js';
 import {
   conversationFingerprint,
   estimateInputTokens,
@@ -10,7 +10,7 @@ import {
   type MessagesBody,
 } from './messages-body.js';
 import { needsReadFirstHint } from './read-first-hint.js';
-import type { QuotaLevel } from '../quota.js';
+import type { QuotaLevel, QuotaSnapshot } from '../quota.js';
 import type { TtlLruStore } from './session-store.js';
 
 export type RouteReason =
@@ -34,7 +34,10 @@ export type RouteReason =
   | 'gemini:text-only:pressure'
   | 'skipped:gemini-unhealthy'
   | 'skipped:gemini-busy'
-  | 'failover:gemini-unavailable';
+  | 'failover:gemini-unavailable'
+  | 'failover:cursor-unavailable'
+  | 'skipped:cursor-unhealthy'
+  | 'skipped:cursor-busy';
 
 export interface RouteDecision {
   readonly route: Route;
@@ -48,6 +51,8 @@ export interface RouteDecision {
   readonly distribution?: Classification;
   readonly classifierMs?: number;
   readonly classifierError?: string;
+  /** Set when this decision serves a turn of a cascade fallback loop (Cursor/Gemini after a Claude 429). */
+  readonly fallbackLoop?: 'cursor' | 'gemini';
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -71,7 +76,7 @@ export interface RouterOptions {
   readonly classifierTimeoutMs: number;
   readonly classifierMaxChars: number;
   /** Claude quota as last seen on an Anthropic response; absent = quota routing off. */
-  readonly quota?: { level(): QuotaLevel };
+  readonly quota?: { level(): QuotaLevel; current?(): QuotaSnapshot | undefined };
   /** Bars used from `pressure` on; each only lowers the normal one. */
   readonly pressurePolicy?: { readonly minCheapProbability: number; readonly minStandardProbability: number };
   readonly geminiPolicy?: import('../domain/policy.js').GeminiPolicyOptions;
@@ -80,7 +85,7 @@ export interface RouterOptions {
   readonly readFirstStandard?: boolean;
 }
 
-const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini'>, number>> = { trivial: 0, standard: 1, primary: 2 };
+const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = { trivial: 0, standard: 1, primary: 2 };
 
 /**
  * Multi-provider router: decides, per conversation, between a cheap
@@ -99,6 +104,8 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini'>, number>> = { trivial: 
 export class Router {
   private readonly lastRouteWasGemini = new Set<string>();
   private readonly lastServedTier = new Map<string, Tier>();
+  /** Cascade fallback loop: conversation key -> CLI tier that served a turn after Claude rate-limited. */
+  private readonly fallbackLoop = new Map<string, 'cursor' | 'gemini'>();
 
   constructor(
     private readonly classifier: ComplexityClassifier,
@@ -122,10 +129,11 @@ export class Router {
       standard: this.options.standardContextTokens ?? this.options.cheapContextTokens,
       primary: Infinity,
       gemini: Infinity,
+      cursor: Infinity,
     };
 
     const stampTransition = (dec: RouteDecision): RouteDecision => {
-      const current = dec.tier ?? (dec.route === 'primary' ? 'primary' : dec.route === 'gemini' ? 'gemini' : 'trivial');
+      const current = dec.tier ?? (dec.route === 'primary' ? 'primary' : dec.route === 'gemini' ? 'gemini' : dec.route === 'cursor' ? 'cursor' : 'trivial');
       this.lastServedTier.set(key, current);
       if (prevServed !== undefined && prevServed !== current) {
         return { ...dec, previousTier: prevServed, modelTransition: true };
@@ -177,6 +185,24 @@ export class Router {
     const sticky: Tier | undefined = (fresh || stored === 'gemini') ? undefined : stored;
 
     const humanText = latestHumanText(ctx.body);
+    // A quota probe (max_tokens <= 1) is never rerouted: it must not be served by a loop CLI tier.
+    const isProbe = typeof ctx.body.max_tokens === 'number' && ctx.body.max_tokens <= 1;
+    const loopTier = this.fallbackLoop.get(key);
+    const loopActive =
+      loopTier && !hasImageDocumentOrToolChoice(ctx.body) && !isProbe ? loopTier : undefined;
+    if (loopActive && humanText === undefined) {
+      // Tool loop of a cascade-served turn: stay on that tier, never hit Claude first.
+      return stampTransition({
+        route: tierRoute(loopActive),
+        tier: loopActive,
+        reason: 'sticky',
+        conversationKey: key,
+        fallbackLoop: loopActive,
+      });
+    }
+    // A new human turn in a loop is NOT decided here: it falls through to the
+    // single classification below, so the risk veto runs before the loop can
+    // hold it (see the loopActive handling after classification).
     if (humanText === undefined) {
       if (
         (stored === 'gemini' || this.lastRouteWasGemini.has(key)) &&
@@ -201,7 +227,7 @@ export class Router {
     const reclassify = level === 'critical' && stored === 'primary' && (sticky === 'primary' || ctx.contextCompacted);
     const classifyForGemini = this.options.geminiPolicy?.enabled && this.options.geminiFromPrimary && sticky === 'primary' && !reclassify;
 
-    if (sticky === 'primary' && !reclassify && !classifyForGemini) return resolve('primary', 'sticky');
+    if (sticky === 'primary' && !reclassify && !classifyForGemini && !loopActive) return resolve('primary', 'sticky');
 
     const started = performance.now();
     let distribution: Classification;
@@ -228,7 +254,36 @@ export class Router {
     // The risk veto runs inside selectTier, before any bar: no quota level moves a risky turn.
     const proposed = selectTier(distribution, policy);
     const extra = { distribution, classifierMs };
-    
+
+    if (loopActive) {
+      // Human turn held by a cascade loop, now classified (single call above).
+      if (hardRiskVeto(distribution)) {
+        // Risky turn leaves the loop for Claude; the loop must not serve it
+        // via a CLI tier or advance it to cheap from a CLI fallback.
+        this.fallbackLoop.delete(key);
+        return resolve('primary', 'classified', extra);
+      }
+      // Hold the loop only while the gate has not cleared. Clear it only when
+      // a snapshot exists AND (its window is not 5h OR its reset has passed);
+      // no snapshot => stay on the loop tier.
+      const snap = this.options.quota?.current?.();
+      const gateClears =
+        snap !== undefined &&
+        (!snap.window.includes('5h') || (snap.resetAt !== undefined && snap.resetAt.getTime() <= Date.now()));
+      if (!gateClears) {
+        return stampTransition({
+          ...extra,
+          route: tierRoute(loopActive),
+          tier: loopActive,
+          reason: 'sticky',
+          conversationKey: key,
+          fallbackLoop: loopActive,
+        });
+      }
+      // Window reset (or not a 5h window): Claude is retried; a fresh 429 re-enters the cascade.
+      this.fallbackLoop.delete(key);
+    }
+
     const needsReadFirst = this.options.readFirstStandard === true && needsReadFirstHint(ctx.body);
 
     let isGeminiEligible = false;
@@ -273,10 +328,12 @@ export class Router {
       }
       let lowered = false;
       if (policy !== this.options.policy) {
-         const normalProposed = selectTier(distribution, this.options.policy);
-         if (normalProposed !== 'gemini' && proposed !== 'gemini') {
-            lowered = TIER_RANK[proposed] < TIER_RANK[normalProposed];
-         }
+        const normalProposed = selectTier(distribution, this.options.policy);
+        // gemini/cursor are transient tiers, not escalation ranks (mirrors policy.ts TIER_RANK).
+        const ranked = (t: Tier): t is Exclude<Tier, 'gemini' | 'cursor'> => t !== 'gemini' && t !== 'cursor';
+        if (ranked(proposed) && ranked(normalProposed)) {
+          lowered = TIER_RANK[proposed] < TIER_RANK[normalProposed];
+        }
       }
       return resolve(proposed, lowered ? 'quota:pressure' : 'classified', extra);
     }
@@ -291,7 +348,29 @@ export class Router {
     if (decision.conversationKey) {
       this.sessions.set(decision.conversationKey, 'primary');
       this.lastRouteWasGemini.delete(decision.conversationKey);
+      this.fallbackLoop.delete(decision.conversationKey);
       this.lastServedTier.set(decision.conversationKey, 'primary');
+    }
+  }
+
+  /** A cascade tier (Cursor/Gemini) served a turn after Claude rate-limited: its tool loop sticks to it. */
+  markFallbackLoop(decision: RouteDecision, served: 'cursor' | 'gemini'): void {
+    const key = decision.conversationKey;
+    if (!key) return;
+    this.fallbackLoop.set(key, served);
+    this.lastServedTier.set(key, served);
+    if (served === 'gemini') this.lastRouteWasGemini.add(key);
+    else this.lastRouteWasGemini.delete(key);
+  }
+
+  /** The fallback loop ended (another tier served): record who served, drop the loop mark. */
+  clearFallbackLoop(decision: RouteDecision, served: Tier): void {
+    const key = decision.conversationKey;
+    if (key) {
+      this.fallbackLoop.delete(key);
+      this.lastRouteWasGemini.delete(key);
+      this.lastServedTier.set(key, served);
+      if (this.sessions.get(key) === 'gemini') this.sessions.set(key, served);
     }
   }
 
@@ -300,6 +379,7 @@ export class Router {
     if (decision.conversationKey) {
       this.sessions.set(decision.conversationKey, 'trivial');
       this.lastRouteWasGemini.delete(decision.conversationKey);
+      this.fallbackLoop.delete(decision.conversationKey);
       this.lastServedTier.set(decision.conversationKey, 'trivial');
     }
   }
@@ -309,12 +389,7 @@ export class Router {
    * transition. A conversation stored as gemini moves to that tier too, or its tool steps would try Gemini again.
    */
   clearGeminiLoop(decision: RouteDecision, served: Tier): void {
-    const key = decision.conversationKey;
-    if (key) {
-      this.lastRouteWasGemini.delete(key);
-      this.lastServedTier.set(key, served);
-      if (this.sessions.get(key) === 'gemini') this.sessions.set(key, served);
-    }
+    this.clearFallbackLoop(decision, served);
   }
 }
 
