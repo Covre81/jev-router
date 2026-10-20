@@ -11,7 +11,7 @@ import type { QuotaStore } from '../quota.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
 import { needsReadFirstHint, withReadFirstHint, needsReadFirstFollowup, READ_FIRST_FOLLOWUP } from '../routing/read-first-hint.js';
-import type { RouteDecision, Router } from '../routing/router.js';
+import type { RouteDecision, RouteReason, Router } from '../routing/router.js';
 import { auditExchange, auditFailure, type ExchangeContext } from '../telemetry/audit.js';
 import { noopTelemetry, type TelemetrySink } from '../telemetry/recorder.js';
 import { forwardableHeaders, presentedCredential, single } from './headers.js';
@@ -335,44 +335,58 @@ export function buildServer({
       }
     };
 
+    /**
+     * Cascade steps after Cursor: Gemini, then cheap; whichever serves holds the fallback loop.
+     * The reason names the tier that failed just before. Returns whether a reply was sent:
+     * never return the relay itself, a FastifyReply is thenable and awaits to undefined.
+     */
+    const serveGeminiOrCheap = async (
+      beforeGemini: RouteReason,
+      sendCheap: () => Promise<ProviderResult>,
+      onServed: () => void = () => {},
+    ): Promise<boolean> => {
+      if (!hasImageDocumentOrToolChoice(base.body!)) {
+        const geminiRes = await tryCliTier('gemini', activeBase);
+        if (geminiRes) {
+          onServed();
+          router.markFallbackLoop(decision, 'gemini');
+          const routeDec: RouteDecision = { ...decision, route: 'gemini', tier: 'gemini', reason: beforeGemini, fallbackLoop: 'gemini' };
+          relay(reply, geminiRes, routeDec, req, exchange('gemini'));
+          return true;
+        }
+      }
+      const cheapRes = await sendCheap();
+      if (cheapRes.kind !== 'response') return false;
+      onServed();
+      // Hold the loop, never demote the session: the quota gate hands the next human turn back to Claude.
+      router.markFallbackLoop(decision, 'trivial');
+      // Gemini counts once the tier is wired in (attempted, or skipped by breaker/image guard).
+      const reason: RouteReason = providers.gemini ? 'failover:gemini-unavailable' : beforeGemini;
+      const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason, fallbackLoop: 'trivial' };
+      relay(reply, cheapRes, routeDec, req, exchange('cheap'));
+      return true;
+    };
+
     if (decision.route === 'cursor') {
       const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('cursor', activeBase);
       if (cursorRes) return relay(reply, cursorRes, decision, req, exchange('cursor'));
 
       // Cascade advance from a fallback-loop continuation: Cursor -> Gemini -> cheap -> primary (one-off, never pinned).
-      const geminiRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('gemini', activeBase);
-      if (geminiRes) {
-        router.markFallbackLoop(decision, 'gemini');
-        const routeDec: RouteDecision = { ...decision, route: 'gemini', tier: 'gemini', reason: 'failover:cursor-unavailable', fallbackLoop: 'gemini' };
-        return relay(reply, geminiRes, routeDec, req, exchange('gemini'));
-      }
-      const cheapRes = await doSendCheapWithRetry(cheapProvider, cheapReq);
-      if (cheapRes.kind === 'response') {
-        if (decision.fallbackLoop) router.markFallbackLoop(decision, 'trivial');
-        else router.useTrivial(decision);
-        const routeDec: RouteDecision = {
-          ...decision,
-          route: 'cheap',
-          tier: 'trivial',
-          reason: 'failover:gemini-unavailable',
-          ...(decision.fallbackLoop ? { fallbackLoop: 'trivial' as const } : {}),
-        };
-        return relay(reply, cheapRes, routeDec, req, exchange('cheap'));
-      }
+      if (await serveGeminiOrCheap('failover:cursor-unavailable', () => doSendCheapWithRetry(cheapProvider, cheapReq))) return reply;
       router.clearFallbackLoop(decision, 'primary');
       const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
       return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
     }
 
     if (decision.route === 'gemini') {
-      const fallbackToPrimary = async (reason: import('../routing/router.js').RouteReason) => {
+      const fallbackToPrimary = async (reason: RouteReason) => {
         router.clearGeminiLoop(decision, 'primary');
         const routeDec: RouteDecision = { ...decision, route: 'primary', reason };
         // base, not activeBase: the Gemini handoff in the system prompt would rewrite Claude's cache.
         return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
       };
 
-      const doFallback = async (reason: import('../routing/router.js').RouteReason) => {
+      const doFallback = async (reason: RouteReason) => {
         if (decision.fallbackLoop) {
           // Cascade continuation: Gemini -> cheap -> primary one-off (never pinToPrimary from a cascade continuation).
           const resCheap = await doSendCheapWithRetry(cheapProvider, cheapReq);
@@ -520,38 +534,13 @@ export function buildServer({
       }
     }
 
-    // Gemini counts in the cascade only when the tier is wired in: attempted, or skipped
-    // (breaker open / image guard). Without a Gemini tier, cheap keeps the pre-cascade reason.
-    const geminiAttemptedOrSkipped = providers.gemini !== undefined;
-    if (geminiAttemptedOrSkipped && !skipCli) {
-      const geminiRes = await tryCliTier('gemini', activeBase);
-      if (geminiRes) {
-        router.markFallbackLoop(decision, 'gemini');
-        upstreamFailureState = primaryFailure;
-        return relay(
-          reply,
-          geminiRes,
-          { ...decision, route: 'gemini', tier: 'gemini', reason: 'failover:cursor-unavailable', fallbackLoop: 'gemini' },
-          req,
-          exchange('gemini'),
-        );
-      }
-    }
-
-    const cheap = await providers.cheap.send(cheapReq);
-    if (cheap.kind === 'response') {
-      upstreamFailureState = primaryFailure;
-      // Cheap served a cascade turn: hold it in the fallback loop so its tool loop stays on
-      // cheap, while the quota gate hands the next human turn back to Claude once it recovers.
-      router.markFallbackLoop(decision, 'trivial');
-      return relay(
-        reply,
-        cheap,
-        { ...decision, route: 'cheap', tier: 'trivial', reason: geminiAttemptedOrSkipped ? 'failover:gemini-unavailable' : 'failover:primary-rate-limited', fallbackLoop: 'trivial' },
-        req,
-        exchange('cheap'),
-      );
-    }
+    // Without a Cursor tier, Gemini/cheap keep the pre-cascade reason.
+    const served = await serveGeminiOrCheap(
+      providers.cursor ? 'failover:cursor-unavailable' : 'failover:primary-rate-limited',
+      () => providers.cheap.send(cheapReq),
+      () => { upstreamFailureState = primaryFailure; },
+    );
+    if (served) return reply;
     const original: ProviderResult = { ...primary, body: Readable.from([errorBody]) };
     return relay(reply, original, decision, req, exchange('primary'));
   }

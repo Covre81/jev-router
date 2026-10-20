@@ -465,6 +465,52 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
     }
   });
 
+  it('9b. without a Gemini tier, cursor->cheap names Cursor as the failed tier', async () => {
+    const primary = rateLimitedPrimary();
+    const cursor: any = {
+      name: 'cursor',
+      hits: 0,
+      async send() {
+        cursor.hits++;
+        return cursor.hits === 1 ? jsonResponse('cursor ok', true) : { kind: 'unavailable', reason: 'exit 1' };
+      },
+    };
+    const cheap = stub('cheap', () => jsonResponse('cheap ok', true));
+    const { proxy, url } = await createTestServer({ primary, cursor, cheap });
+    const toolTurn = (extra: any[] = []) => ({
+      model: 'claude',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
+        ...extra,
+      ],
+    });
+    try {
+      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-adv-nogem');
+      assert.equal(r1.statusCode, 200);
+      assert.equal(r1.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      await r1.body.text();
+
+      const r2 = await send(url, toolTurn(), 'cascade-s-adv-nogem');
+      assert.equal(r2.statusCode, 200);
+      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=failover:cursor-unavailable');
+      await r2.body.text();
+
+      const r3 = await send(url, toolTurn([
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'more' }] },
+      ]), 'cascade-s-adv-nogem');
+      assert.equal(r3.statusCode, 200);
+      assert.equal(r3.headers['x-jev-route'], 'cheap; reason=sticky');
+      await r3.body.text();
+      assert.equal(primary.hits, 1);
+      assert.equal(cheap.hits, 2);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   it('10. primary 529 served by Cursor', async () => {
     const primary = rateLimitedPrimary(529);
     const cursor = stub('cursor', () => jsonResponse('cursor ok'));
