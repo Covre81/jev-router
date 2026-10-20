@@ -151,6 +151,46 @@ describe('router fallback-loop stickiness', () => {
     assert.equal(dec.route, 'gemini');
     assert.equal(dec.reason, 'sticky');
   });
+
+  it('cascade cheap failover: tool continuation routes to cheap (trivial) without demoting primary session', async () => {
+    const snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const { router, store } = setup(() => snap);
+    store.set('s1:main', 'primary');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    assert.equal(store.get('s1:main'), 'primary');
+    const dec = await router.decide(req(toolTurn));
+    assert.equal(dec.route, 'cheap');
+    assert.equal(dec.tier, 'trivial');
+    assert.equal(dec.fallbackLoop, 'trivial');
+    assert.equal(store.get('s1:main'), 'primary');
+  });
+
+  it('cascade cheap failover: non-exhausted quota releases next human turn to primary and clears loop', async () => {
+    const snap: any = { utilization: 0.2, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const { router, store } = setup(() => snap);
+    store.set('s1:main', 'primary');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    const dec = await router.decide(req(humanTurn));
+    assert.equal(dec.route, 'primary');
+    assert.equal(dec.tier, 'primary');
+    assert.equal(store.get('s1:main'), 'primary');
+    // loop cleared: a tool continuation no longer sticks to cheap
+    const cont = await router.decide(req(toolTurn));
+    assert.notEqual(cont.route, 'cheap');
+    assert.notEqual(cont.tier, 'trivial');
+  });
+
+  it('cascade cheap failover: exhausted quota keeps next human turn on cheap', async () => {
+    const snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const { router, store } = setup(() => snap);
+    store.set('s1:main', 'primary');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    const dec = await router.decide(req(humanTurn));
+    assert.equal(dec.route, 'cheap');
+    assert.equal(dec.tier, 'trivial');
+    assert.equal(dec.fallbackLoop, 'trivial');
+    assert.equal(store.get('s1:main'), 'primary');
+  });
 });
 
 async function fakeCursorRoot() {

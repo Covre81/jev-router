@@ -52,7 +52,7 @@ export interface RouteDecision {
   readonly classifierMs?: number;
   readonly classifierError?: string;
   /** Set when this decision serves a turn of a cascade fallback loop (Cursor/Gemini after a Claude 429). */
-  readonly fallbackLoop?: 'cursor' | 'gemini';
+  readonly fallbackLoop?: 'cursor' | 'gemini' | 'trivial';
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -107,7 +107,7 @@ export class Router {
   private readonly lastRouteWasGemini = new Set<string>();
   private readonly lastServedTier = new Map<string, Tier>();
   /** Cascade fallback loop: conversation key -> CLI tier + mark time. Entries older than the session TTL are pruned lazily on read/mark (no timers). */
-  private readonly fallbackLoop = new Map<string, { readonly tier: 'cursor' | 'gemini'; markedAt: number }>();
+  private readonly fallbackLoop = new Map<string, { readonly tier: 'cursor' | 'gemini' | 'trivial'; markedAt: number }>();
 
   private fallbackLoopTtlMs(): number {
     return this.options.sessionTtlMs ?? 6 * 60 * 60 * 1000;
@@ -120,7 +120,7 @@ export class Router {
     }
   }
 
-  private fallbackLoopTier(key: string): 'cursor' | 'gemini' | undefined {
+  private fallbackLoopTier(key: string): 'cursor' | 'gemini' | 'trivial' | undefined {
     const entry = this.fallbackLoop.get(key);
     if (!entry) return undefined;
     if (Date.now() - entry.markedAt > this.fallbackLoopTtlMs()) {
@@ -381,7 +381,7 @@ export class Router {
   }
 
   /** A cascade tier (Cursor/Gemini) served a turn after Claude rate-limited: its tool loop sticks to it. */
-  markFallbackLoop(decision: RouteDecision, served: 'cursor' | 'gemini'): void {
+  markFallbackLoop(decision: RouteDecision, served: 'cursor' | 'gemini' | 'trivial'): void {
     const key = decision.conversationKey;
     if (!key) return;
     this.pruneFallbackLoop();

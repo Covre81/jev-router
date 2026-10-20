@@ -348,8 +348,15 @@ export function buildServer({
       }
       const cheapRes = await doSendCheapWithRetry(cheapProvider, cheapReq);
       if (cheapRes.kind === 'response') {
-        router.useTrivial(decision);
-        const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason: 'failover:gemini-unavailable' };
+        if (decision.fallbackLoop) router.markFallbackLoop(decision, 'trivial');
+        else router.useTrivial(decision);
+        const routeDec: RouteDecision = {
+          ...decision,
+          route: 'cheap',
+          tier: 'trivial',
+          reason: 'failover:gemini-unavailable',
+          ...(decision.fallbackLoop ? { fallbackLoop: 'trivial' as const } : {}),
+        };
         return relay(reply, cheapRes, routeDec, req, exchange('cheap'));
       }
       router.clearFallbackLoop(decision, 'primary');
@@ -370,8 +377,8 @@ export function buildServer({
           // Cascade continuation: Gemini -> cheap -> primary one-off (never pinToPrimary from a cascade continuation).
           const resCheap = await doSendCheapWithRetry(cheapProvider, cheapReq);
           if (resCheap.kind === 'response') {
-            router.useTrivial(decision);
-            const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason };
+            router.markFallbackLoop(decision, 'trivial');
+            const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason, fallbackLoop: 'trivial' };
             return relay(reply, resCheap, routeDec, req, exchange('cheap'));
           }
           router.clearFallbackLoop(decision, 'primary');
@@ -532,13 +539,13 @@ export function buildServer({
     const cheap = await providers.cheap.send(cheapReq);
     if (cheap.kind === 'response') {
       upstreamFailureState = primaryFailure;
-      // Cheap served a cascade turn: record trivial so its tool loop stays on
-      // cheap instead of bouncing off the rate-limited Claude.
-      router.useTrivial(decision);
+      // Cheap served a cascade turn: hold it in the fallback loop so its tool loop stays on
+      // cheap, while the quota gate hands the next human turn back to Claude once it recovers.
+      router.markFallbackLoop(decision, 'trivial');
       return relay(
         reply,
         cheap,
-        { ...decision, route: 'cheap', tier: 'trivial', reason: geminiAttemptedOrSkipped ? 'failover:gemini-unavailable' : 'failover:primary-rate-limited' },
+        { ...decision, route: 'cheap', tier: 'trivial', reason: geminiAttemptedOrSkipped ? 'failover:gemini-unavailable' : 'failover:primary-rate-limited', fallbackLoop: 'trivial' },
         req,
         exchange('cheap'),
       );

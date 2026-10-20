@@ -48,6 +48,7 @@ async function createTestServer(opts: {
   cheap?: Provider & { hits: number };
   primary?: Provider & { hits: number };
   classification?: any;
+  quota?: () => any;
 }) {
   const config = loadConfig({
     CLASSIFIER: 'heuristic',
@@ -63,6 +64,7 @@ async function createTestServer(opts: {
     cheapContextTokens: 100_000,
     classifierMaxChars: 4000,
     classifierTimeoutMs: 1500,
+    ...(opts.quota ? { quota: { level: () => (opts.quota!()?.utilization >= 1 ? 'critical' : 'none'), current: opts.quota } } : {}),
   } as any);
   const providers: any = {
     primary: opts.primary,
@@ -231,6 +233,43 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
       await r2.body.text();
       assert.equal(primary.hits, 1);
       assert.equal(cheap.hits, 2);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('3c. cheap cascade turn does not demote the session: recovered quota sends the next human turn to Claude', async () => {
+    let limited = true;
+    const primary = stub('primary', () =>
+      limited
+        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
+        : jsonResponse('claude ok'));
+    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
+    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
+    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
+    let snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, quota: () => snap, classification: cls });
+    try {
+      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s3c');
+      assert.equal(r1.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
+      await r1.body.text();
+
+      limited = false;
+      snap = { utilization: 0.2, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+      Object.assign(cls, { simple: 0.99, structural: 0.01, risk: 0 });
+      const r2 = await send(url, {
+        model: 'claude',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: 'cheap ok' },
+          { role: 'user', content: 'thanks, what time is it in London?' },
+        ],
+      }, 'cascade-s3c');
+      assert.equal(r2.statusCode, 200);
+      assert.match(String(r2.headers['x-jev-route']), /^primary;/);
+      await r2.body.text();
+      assert.equal(cheap.hits, 1);
     } finally {
       await proxy.close();
     }
