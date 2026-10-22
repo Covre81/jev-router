@@ -69,6 +69,7 @@ const Env = z
     CHEAP_RETRY_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
     CHEAP_READ_FIRST_HINT: bool.default(true),
     CHEAP_READ_FIRST_STANDARD: bool.default(true),
+    PRIMARY_PROFILES: bool.default(false),
 
     TELEMETRY_ENABLED: bool.default(true),
     TELEMETRY_DIAGNOSTICS: bool.default(false),
@@ -190,6 +191,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     },
     cheapReadFirstHint: e.CHEAP_READ_FIRST_HINT,
     readFirstStandard: e.CHEAP_READ_FIRST_STANDARD,
+    primaryProfiles: e.PRIMARY_PROFILES,
     // undefined = standard tier off: level-2 work stays on the primary (the old behavior).
     cheapStandard:
       e.CHEAP_MODEL_STANDARD === 'off'
