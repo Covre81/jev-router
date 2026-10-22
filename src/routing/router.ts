@@ -1,6 +1,6 @@
 import type { Classification, ComplexityClassifier } from '../classifier/classifier.js';
 import type { ComplexityDistribution } from '../domain/complexity.js';
-import { selectTier, stickyTier, tierRoute, geminiEligible, hardRiskVeto, type PolicyOptions, type Route, type Tier } from '../domain/policy.js';
+import { selectTier, stickyTier, tierRoute, geminiEligible, hardRiskVeto, primaryProfile, type PolicyOptions, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
 import {
   conversationFingerprint,
   estimateInputTokens,
@@ -27,6 +27,7 @@ export type RouteReason =
   | 'failover:standard-unavailable'
   | 'skipped:cheap-unhealthy'
   | 'pinned:compaction'
+  | 'profile:refused'
   | 'quota:pressure'
   | 'quota:reclassified'
   | 'read-first:standard'
@@ -54,6 +55,8 @@ export interface RouteDecision {
   readonly classifierError?: string;
   /** Set when this decision serves a turn of a cascade fallback loop (Cursor/Gemini after a Claude 429). */
   readonly fallbackLoop?: 'cursor' | 'gemini' | 'trivial';
+  /** Claude model + effort for this main-loop turn; absent = forward the client's own. */
+  readonly primaryProfile?: PrimaryProfile;
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -86,6 +89,8 @@ export interface RouterOptions {
   readonly sessionTtlMs?: number;
   /** route first open-ended project-state turns to the standard tier */
   readonly readFirstStandard?: boolean;
+  /** Let JEV pick Claude model + effort per session (PRIMARY_PROFILES). */
+  readonly primaryProfiles?: boolean;
 }
 
 const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = { trivial: 0, standard: 1, primary: 2 };
@@ -107,6 +112,8 @@ const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = 
 export class Router {
   private readonly lastRouteWasGemini = new Set<string>();
   private readonly lastServedTier = new Map<string, Tier>();
+  /** null = Anthropic refused this session's profile: the client default serves until a fresh start. */
+  private readonly profiles = new Map<string, PrimaryProfile | null>();
   /** Cascade fallback loop: conversation key -> CLI tier + mark time. Entries older than the session TTL are pruned lazily on read/mark (no timers). */
   private readonly fallbackLoop = new Map<string, { readonly tier: 'cursor' | 'gemini' | 'trivial'; markedAt: number }>();
 
@@ -137,7 +144,58 @@ export class Router {
     private readonly options: RouterOptions,
   ) {}
 
+  /**
+   * Claude model + effort, fixed per session: chosen where there is no Claude
+   * cache to lose — the session starts on Claude, climbs to it from a cheap
+   * tier, or compacts (the prompt is rebuilt anyway) — and kept until the next
+   * of those. Switching model mid-session would rewrite the whole prompt cache
+   * at the new model's price. Every decision of the session carries it, so a
+   * failover send to Claude hits the same cache.
+   */
   async decide(ctx: RequestContext): Promise<RouteDecision> {
+    const dec = await this.decideTier(ctx);
+    if (this.options.primaryProfiles && ctx.requestClass === 'compaction' && ctx.sessionId) {
+      // The summary request re-reads the session's cached history: same model, never a new pick.
+      const stored = this.profiles.get(`${ctx.sessionId}:${ctx.agentId ?? 'main'}`);
+      return stored ? { ...dec, primaryProfile: stored } : dec;
+    }
+    const key = dec.conversationKey;
+    if (!this.options.primaryProfiles || ctx.requestClass !== 'main' || !key) return dec;
+    if (isFreshConversation(ctx.body) || (ctx.contextCompacted && this.profiles.get(key) !== null)) this.profiles.delete(key);
+    let profile = this.profiles.get(key);
+    const opening =
+      isFreshConversation(ctx.body) || ctx.contextCompacted || dec.previousTier === 'trivial' || dec.previousTier === 'standard';
+    if (profile === undefined && dec.route === 'primary' && opening) {
+      const distribution = dec.distribution ?? (ctx.contextCompacted ? await this.classifyForProfile(ctx) : undefined);
+      if (distribution) {
+        profile = primaryProfile(distribution);
+        // ponytail: unbounded like lastServedTier; one small entry per session
+        this.profiles.set(key, profile);
+      }
+    }
+    return profile ? { ...dec, primaryProfile: profile } : dec;
+  }
+
+  /** pinned:compaction skips JEV for routing; the profile still needs a score. Failure keeps the client default. */
+  private async classifyForProfile(ctx: RequestContext): Promise<Classification | undefined> {
+    const text = latestHumanText(ctx.body);
+    if (text === undefined) return undefined;
+    try {
+      return await this.classifier.classify(
+        {
+          text: text.slice(0, this.options.classifierMaxChars),
+          turnCount: ctx.body.messages.length,
+          toolCount: Array.isArray(ctx.body['tools']) ? ctx.body['tools'].length : 0,
+          estimatedInputTokens: estimateInputTokens(ctx.rawByteLength),
+        },
+        AbortSignal.timeout(this.options.classifierTimeoutMs),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async decideTier(ctx: RequestContext): Promise<RouteDecision> {
     if (ctx.requestClass && this.options.primaryClasses.has(ctx.requestClass)) {
       return { route: 'primary', reason: 'passthrough:request-class', conversationKey: undefined };
     }
@@ -389,6 +447,11 @@ export class Router {
     } catch {
       return true;
     }
+  }
+
+  /** Anthropic refused the rewritten model/effort: stop rewriting this session until it starts over. */
+  refusePrimaryProfile(decision: RouteDecision): void {
+    if (decision.conversationKey) this.profiles.set(decision.conversationKey, null);
   }
 
   /** The cheap provider could not serve this conversation: keep it on the primary from now on. */

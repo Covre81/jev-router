@@ -4,12 +4,13 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type { Dispatcher } from 'undici';
 import type { BuildInfo } from '../build-info.js';
 import type { Config } from '../config.js';
-import { hardRiskVeto, type Route, type Tier } from '../domain/policy.js';
+import { hardRiskVeto, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
 import type { CheapState } from '../providers/cheap-health.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
+import { withPrimaryProfile } from '../routing/primary-profile.js';
 import { needsReadFirstHint, withReadFirstHint, needsReadFirstFollowup, READ_FIRST_FOLLOWUP } from '../routing/read-first-hint.js';
 import type { RouteDecision, RouteReason, Router } from '../routing/router.js';
 import { auditExchange, auditFailure, type ExchangeContext } from '../telemetry/audit.js';
@@ -254,7 +255,7 @@ export function buildServer({
       return second;
     };
 
-    const exchange = (route: Route, modelOverride?: string): ExchangeContext => {
+    const exchange = (route: Route, modelOverride?: string, effortOverride?: string): ExchangeContext => {
       let diagnostics: ExchangeContext['diagnostics'];
       if (config.telemetry?.diagnostics) {
         try {
@@ -279,7 +280,7 @@ export function buildServer({
             maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
             thinkingType: typeof body['thinking'] === 'object' && body['thinking'] ? (body['thinking'] as any).type : undefined,
             thinkingBudget: typeof body['thinking'] === 'object' && body['thinking'] ? (body['thinking'] as any).budget_tokens : undefined,
-            effort: typeof body['output_config'] === 'object' && body['output_config'] ? (body['output_config'] as any).effort : undefined,
+            effort: effortOverride ?? (typeof body['output_config'] === 'object' && body['output_config'] ? (body['output_config'] as any).effort : undefined),
           };
         } catch (err) {
           req.log.warn({ err }, 'diagnostics capture failed');
@@ -290,7 +291,7 @@ export function buildServer({
         startedAtMs,
         humanText: latestHumanText(base.body!),
         requestClass: single(req.headers, 'x-claude-code-request-class'),
-        model: route === 'primary' ? base.body!.model : route === 'gemini' ? config.gemini?.model : route === 'cursor' ? config.cursor?.model : (modelOverride ?? cheapModel),
+        model: route === 'primary' ? (modelOverride ?? base.body!.model) : route === 'gemini' ? config.gemini?.model : route === 'cursor' ? config.cursor?.model : (modelOverride ?? cheapModel),
         requestedModel: base.body!.model,
         toolsOffered: Array.isArray(base.body!['tools']) ? base.body!['tools'].length : 0,
         quotaUtilization: quota?.current()?.utilization,
@@ -369,6 +370,31 @@ export function buildServer({
       return true;
     };
 
+    /**
+     * Every Claude send carries the session's primary profile. A 400 on the rewritten body
+     * resends the original; the session drops profiles only when that original is accepted
+     * (a 400 on both is the request's own fault, e.g. prompt too long).
+     */
+    // served is the profile that went out; exchange() snapshots failure state, so build it at relay time.
+    const sendClaude = async (b: ProviderRequest, dec: RouteDecision): Promise<{ result: ProviderResult; dec: RouteDecision; served?: PrimaryProfile }> => {
+      const profile = dec.primaryProfile;
+      const profiled = profile && b.rawBody ? withPrimaryProfile(b.rawBody, profile) : undefined;
+      if (!profile || !profiled) return { result: await sendPrimary(b), dec };
+      const first = await sendPrimary({ ...b, rawBody: profiled });
+      if (first.kind !== 'response' || first.status !== 400) return { result: first, dec, served: profile };
+      const error = Buffer.concat(await first.body.toArray()).toString('utf8').slice(0, 500);
+      const result = await sendPrimary(b);
+      if (result.kind === 'response' && result.status === 400) return { result, dec };
+      req.log.warn({ profile, error }, 'primary profile refused, cleared');
+      router.refusePrimaryProfile(dec);
+      const refused: RouteDecision = { ...dec, reason: 'profile:refused' };
+      return { result, dec: refused };
+    };
+    const relayClaude = async (b: ProviderRequest, dec: RouteDecision) => {
+      const c = await sendClaude(b, dec);
+      return relay(reply, c.result, c.dec, req, exchange('primary', c.served?.model, c.served?.effort));
+    };
+
     if (decision.route === 'cursor') {
       const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('cursor', activeBase);
       if (cursorRes) return relay(reply, cursorRes, decision, req, exchange('cursor'));
@@ -377,7 +403,7 @@ export function buildServer({
       if (await serveGeminiOrCheap('failover:cursor-unavailable', () => doSendCheapWithRetry(cheapProvider, cheapReq))) return reply;
       router.clearFallbackLoop(decision, 'primary');
       const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
-      return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+      return relayClaude(base, routeDec);
     }
 
     if (decision.route === 'gemini') {
@@ -385,7 +411,7 @@ export function buildServer({
         router.clearGeminiLoop(decision, 'primary');
         const routeDec: RouteDecision = { ...decision, route: 'primary', reason };
         // base, not activeBase: the Gemini handoff in the system prompt would rewrite Claude's cache.
-        return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+        return relayClaude(base, routeDec);
       };
 
       const doFallback = async (reason: RouteReason) => {
@@ -399,7 +425,7 @@ export function buildServer({
           }
           router.clearFallbackLoop(decision, 'primary');
           const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
-          return relay(reply, await sendPrimary(base), routeDec, req, exchange('primary'));
+          return relayClaude(base, routeDec);
         }
 
         if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
@@ -460,7 +486,7 @@ export function buildServer({
     if (decision.route === 'cheap' && cheapHealth?.state === 'down') {
       const skipped: RouteDecision = { ...decision, route: 'primary', reason: 'skipped:cheap-unhealthy' };
       upstreamFailureState = { failure: 'skipped' };
-      return relay(reply, await sendPrimary(base), skipped, req, exchange('primary'));
+      return relayClaude(base, skipped);
     }
 
     if (decision.route === 'cheap') {
@@ -480,23 +506,25 @@ export function buildServer({
       router.pinToPrimary(decision);
       const failover: RouteDecision = { ...decision, route: 'primary', reason: 'failover:cheap-unavailable' };
       req.log.warn({ reason: cheap.reason, conversation: decision.conversationKey }, 'cheap provider unavailable');
-      return relay(reply, await sendPrimary(base), failover, req, exchange('primary'));
+      return relayClaude(base, failover);
     }
 
-    const primary = await sendPrimary(activeBase);
+    const claude = await sendClaude(activeBase, decision);
+    const primary = claude.result;
+    const primaryDecision = claude.dec;
     if (
       primary.kind === 'unavailable' ||
       !config.router.failoverOnPrimaryRateLimit ||
       !PRIMARY_RATE_LIMITED.has(primary.status)
     ) {
-      return relay(reply, primary, decision, req, exchange('primary'));
+      return relay(reply, primary, primaryDecision, req, exchange('primary', claude.served?.model, claude.served?.effort));
     }
 
     if (isQuotaProbe(base.body)) {
       const quotaHeaderNames = rateLimitHeaderNames(primary.headers);
       req.log.info({ status: primary.status, quotaHeaderNames }, 'primary rate-limited probe passed through');
       upstreamFailureState = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
-      return relay(reply, primary, decision, req, exchange('primary'));
+      return relay(reply, primary, primaryDecision, req, exchange('primary', claude.served?.model, claude.served?.effort));
     }
 
     const quotaHeaderNames = rateLimitHeaderNames(primary.headers);

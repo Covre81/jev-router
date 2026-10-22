@@ -113,6 +113,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
           }
         : {}),
       readFirstStandard: config.cheapReadFirstHint && config.readFirstStandard && config.cheapStandard !== undefined,
+      primaryProfiles: config.primaryProfiles,
     },
   );
 
