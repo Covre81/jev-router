@@ -57,6 +57,8 @@ export interface RouteDecision {
   readonly fallbackLoop?: 'cursor' | 'gemini' | 'trivial';
   /** Claude model + effort for this main-loop turn; absent = forward the client's own. */
   readonly primaryProfile?: PrimaryProfile;
+  /** JEV score behind a profile picked outside routing (compaction): telemetry only, the risk veto re-classifies. */
+  readonly profileScore?: Classification;
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -163,17 +165,20 @@ export class Router {
     if (!this.options.primaryProfiles || ctx.requestClass !== 'main' || !key) return dec;
     if (isFreshConversation(ctx.body) || (ctx.contextCompacted && this.profiles.get(key) !== null)) this.profiles.delete(key);
     let profile = this.profiles.get(key);
+    let profileScore: Classification | undefined;
     const opening =
       isFreshConversation(ctx.body) || ctx.contextCompacted || dec.previousTier === 'trivial' || dec.previousTier === 'standard';
     if (profile === undefined && dec.route === 'primary' && opening) {
-      const distribution = dec.distribution ?? (ctx.contextCompacted ? await this.classifyForProfile(ctx) : undefined);
+      if (!dec.distribution && ctx.contextCompacted) profileScore = await this.classifyForProfile(ctx);
+      const distribution = dec.distribution ?? profileScore;
       if (distribution) {
         profile = primaryProfile(distribution);
         // ponytail: unbounded like lastServedTier; one small entry per session
         this.profiles.set(key, profile);
       }
     }
-    return profile ? { ...dec, primaryProfile: profile } : dec;
+    // The compaction pick carries its score so telemetry records why that model was chosen.
+    return profile ? { ...dec, ...(profileScore && { profileScore }), primaryProfile: profile } : dec;
   }
 
   /** pinned:compaction skips JEV for routing; the profile still needs a score. Failure keeps the client default. */

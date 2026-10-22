@@ -113,7 +113,7 @@ export function isAcknowledgement(text: string): boolean {
 }
 
 export function jevDecisionOf(decision: RouteDecision): JevDecision | null {
-  const d = decision.distribution;
+  const d = decision.distribution ?? decision.profileScore;
   if (!d) return null;
   return {
     simple: d.simple,
