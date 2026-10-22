@@ -372,8 +372,7 @@ export function buildServer({
 
     /**
      * Every Claude send carries the session's primary profile. A 400 on the rewritten body
-     * resends the original; the session drops profiles only when that original is accepted
-     * (a 400 on both is the request's own fault, e.g. prompt too long).
+     * resends the original; the session drops profiles only when that original succeeds (2xx).
      */
     // served is the profile that went out; exchange() snapshots failure state, so build it at relay time.
     const sendClaude = async (b: ProviderRequest, dec: RouteDecision): Promise<{ result: ProviderResult; dec: RouteDecision; served?: PrimaryProfile }> => {
@@ -384,7 +383,8 @@ export function buildServer({
       if (first.kind !== 'response' || first.status !== 400) return { result: first, dec, served: profile };
       const error = Buffer.concat(await first.body.toArray()).toString('utf8').slice(0, 500);
       const result = await sendPrimary(b);
-      if (result.kind === 'response' && result.status === 400) return { result, dec };
+      // Only an accepted original proves the rewrite was the problem; 4xx/429/5xx/network say nothing about it.
+      if (result.kind !== 'response' || result.status < 200 || result.status >= 300) return { result, dec };
       req.log.warn({ profile, error }, 'primary profile refused, cleared');
       router.refusePrimaryProfile(dec);
       const refused: RouteDecision = { ...dec, reason: 'profile:refused' };
