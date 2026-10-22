@@ -13,8 +13,11 @@ import type { ComplexityDistribution } from '../src/domain/complexity.js';
 import { primaryProfile, type Tier } from '../src/domain/policy.js';
 import { MessagesBody } from '../src/routing/messages-body.js';
 import { withPrimaryProfile } from '../src/routing/primary-profile.js';
-import { Router, type RequestContext } from '../src/routing/router.js';
+import { Router, type RequestContext, type RouterOptions } from '../src/routing/router.js';
+import type { QuotaSnapshot } from '../src/quota.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
+import { jevDecisionOf } from '../src/telemetry/audit.js';
+import type { NewRouterLog } from '../src/telemetry/schema.js';
 
 const OPUS = 'claude-opus-5-5';
 const SONNET = 'claude-sonnet-5-5';
@@ -77,7 +80,7 @@ const SIMPLE: ComplexityDistribution = { simple: 0.92, standard: 0.06, structura
 const STANDARD: ComplexityDistribution = { simple: 0.4, standard: 0.5, structural: 0.1 };
 const STRUCTURAL: ComplexityDistribution = { simple: 0.03, standard: 0.12, structural: 0.85 };
 
-function setup(script: () => ComplexityDistribution, primaryProfiles = true) {
+function setup(script: () => ComplexityDistribution, primaryProfiles = true, quota?: RouterOptions['quota']) {
   return new Router(new ScriptedClassifier(script), new TtlLruStore<Tier>(100, 60_000), {
     policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
     primaryClasses: new Set(['auxiliary', 'compaction']),
@@ -85,6 +88,7 @@ function setup(script: () => ComplexityDistribution, primaryProfiles = true) {
     classifierTimeoutMs: 1_000,
     classifierMaxChars: 4_000,
     primaryProfiles,
+    ...(quota && { quota }),
   });
 }
 
@@ -130,6 +134,9 @@ describe('Router primary profile', () => {
     assert.equal(compacted.route, 'primary');
     assert.equal(compacted.reason, 'pinned:compaction');
     assert.deepEqual(compacted.primaryProfile, { model: OPUS, effort: 'high' });
+    // The pick's score rides on the decision, so telemetry records why that model was chosen.
+    assert.equal(jevDecisionOf(compacted)?.structural, STRUCTURAL.structural);
+    assert.equal(compacted.distribution, undefined, 'not a routing score: the 429 risk veto must classify on its own');
     next = SIMPLE;
     const after = await router.decide(ctx([user('summary'), assistantText, user('continua'), assistantToolUse, toolResult]));
     assert.deepEqual(after.primaryProfile, { model: OPUS, effort: 'high' });
@@ -209,7 +216,13 @@ describe('server: primary profile on the wire', () => {
   let status = 200;
   let fails = 1;
   let second = 200; // status of the send right after the failing ones
+  let cheapUp = false;
+  let quota: QuotaSnapshot | undefined;
+  let score = STANDARD;
+  const scores: object[] = []; // consumed first, one per classifier call
+  const rows: NewRouterLog[] = [];
   let anthropic: Server;
+  let cheap: Server;
   let proxy: FastifyInstance;
   let url: string;
 
@@ -222,18 +235,26 @@ describe('server: primary profile on the wire', () => {
       res.writeHead(code, { 'content-type': 'application/json' }).end(code === 200 ? '{"type":"message","content":[]}' : '{"type":"error","error":{"type":"invalid_request_error","message":"no"}}');
     });
     await new Promise<void>((r) => anthropic.listen(0, '127.0.0.1', r));
+    // The reserve tier: down unless a test brings it up, so a Claude 5xx/429 is relayed as is.
+    cheap = createServer(async (req, res) => {
+      for await (const _ of req);
+      if (!cheapUp) return res.writeHead(503).end();
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { content: 'Hi' }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 5 } }));
+    });
+    await new Promise<void>((r) => cheap.listen(0, '127.0.0.1', r));
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
       ANTHROPIC_UPSTREAM_URL: `http://127.0.0.1:${(anthropic.address() as AddressInfo).port}`,
-      CHEAP_BASE_URL: 'http://127.0.0.1:9/v1',
+      CHEAP_BASE_URL: `http://127.0.0.1:${(cheap.address() as AddressInfo).port}/v1`,
       CHEAP_API_KEY: 'k',
       LOG_LEVEL: 'fatal',
     });
-    const router = setup(() => STANDARD);
+    const router = setup(() => (scores.shift() as ComplexityDistribution | undefined) ?? score, true, { level: () => 'none', current: () => quota });
     proxy = buildServer({
       config,
       router,
       providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      telemetry: { record: (r) => void rows.push(r), close: async () => {} },
     });
     await proxy.listen({ host: '127.0.0.1', port: 0 });
     url = `http://127.0.0.1:${(proxy.server.address() as AddressInfo).port}`;
@@ -241,12 +262,18 @@ describe('server: primary profile on the wire', () => {
   after(async () => {
     await proxy.close();
     anthropic.close();
+    cheap.close();
   });
   beforeEach(() => {
     sent.length = 0;
     status = 200;
     fails = 1;
     second = 200;
+    cheapUp = false;
+    quota = undefined;
+    score = STANDARD;
+    scores.length = 0;
+    rows.length = 0;
   });
 
   const turn = (session: string, messages: unknown[] = [user('refatora esse modulo')], requestClass = 'main') =>
@@ -306,6 +333,66 @@ describe('server: primary profile on the wire', () => {
     const next = await turn('W5', [user('refatora esse modulo'), assistantText, user('continua')]);
     await next.body.text();
     assert.equal(sent[2].model, SONNET);
+  });
+
+  it('a Sonnet session that fails over on a 429 comes back to Claude still on Sonnet (cache kept)', async () => {
+    fails = 1;
+    second = 429; // sends: 1 ok, 2 rate-limited, 3 ok
+    cheapUp = true;
+    await (await turn('W6')).body.text();
+    score = STRUCTURAL; // a re-pick on the way back would show up as Opus
+
+    const limited = await turn('W6', [user('refatora esse modulo'), assistantToolUse, toolResult]);
+    await limited.body.text();
+    assert.equal(limited.statusCode, 200);
+    assert.equal(limited.headers['x-jev-route'], 'cheap; reason=failover:primary-rate-limited');
+
+    // While the quota is exhausted the reserve keeps the session.
+    const history = [user('refatora esse modulo'), assistantToolUse, toolResult, assistantText];
+    quota = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
+    const held = await turn('W6', [...history, user('continua')]);
+    await held.body.text();
+    assert.equal(held.headers['x-jev-route'], 'cheap; reason=sticky');
+
+    // Quota back: Claude again, on the session's Sonnet, not the client's Opus.
+    quota = { utilization: 0.4, window: '5h', observedAt: new Date() };
+    const back = await turn('W6', [...history, user('continua'), assistantText, user('e agora?')]);
+    await back.body.text();
+    assert.equal(back.statusCode, 200);
+    assert.match(String(back.headers['x-jev-route']), /^primary;/);
+    assert.deepEqual(sent.map((b) => b.model), [SONNET, SONNET, SONNET]);
+  });
+
+  it('records jev_decision for the profile picked at compaction (why that model)', async () => {
+    await (await turn('W8')).body.text();
+    scores.push(STRUCTURAL);
+    const res = await request(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ant-client', 'x-claude-code-session-id': 'W8', 'x-claude-code-request-class': 'main', 'x-claude-code-context-compacted': '1' },
+      body: JSON.stringify({ model: OPUS, max_tokens: 1000, output_config: { effort: 'medium' }, messages: [user('summary'), assistantText, user('continua')] }),
+    });
+    await res.body.text();
+    for (let i = 0; i < 50 && !rows.some((r) => r.routeReason === 'pinned:compaction'); i++) await new Promise((r) => setTimeout(r, 10));
+    const row = rows.find((r) => r.routeReason === 'pinned:compaction');
+    assert.equal(sent[1].model, OPUS);
+    assert.equal(row?.jevDecision?.structural, STRUCTURAL.structural);
+  });
+
+  it('after compaction, the 429 risk veto classifies again instead of reusing the profile score', async () => {
+    await (await turn('W7')).body.text();
+    fails = 1;
+    second = 429;
+    cheapUp = true;
+    scores.push(STANDARD, { ...STANDARD, risk: 0.95 }); // profile pick: harmless; veto's own call: risky
+    const res = await request(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'sk-ant-client', 'x-claude-code-session-id': 'W7', 'x-claude-code-request-class': 'main', 'x-claude-code-context-compacted': '1' },
+      body: JSON.stringify({ model: OPUS, max_tokens: 1000, output_config: { effort: 'medium' }, messages: [user('summary'), assistantText, user('continua')] }),
+    });
+    await res.body.text();
+    assert.equal(scores.length, 0, 'JEV was asked twice: once for the profile, once by the veto');
+    assert.equal(res.statusCode, 429, 'the risky turn stays on Claude; the reserve is not tried');
+    assert.equal(sent[1].model, SONNET);
   });
 
   it('sends the compaction request of a Sonnet session as Sonnet', async () => {
