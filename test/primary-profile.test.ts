@@ -208,6 +208,7 @@ describe('server: primary profile on the wire', () => {
   const sent: any[] = [];
   let status = 200;
   let fails = 1;
+  let second = 200; // status of the send right after the failing ones
   let anthropic: Server;
   let proxy: FastifyInstance;
   let url: string;
@@ -217,7 +218,7 @@ describe('server: primary profile on the wire', () => {
       const parts: Buffer[] = [];
       for await (const c of req) parts.push(c as Buffer);
       sent.push(JSON.parse(Buffer.concat(parts).toString('utf8')));
-      const code = sent.length <= fails ? status : 200;
+      const code = sent.length <= fails ? status : sent.length === fails + 1 ? second : 200;
       res.writeHead(code, { 'content-type': 'application/json' }).end(code === 200 ? '{"type":"message","content":[]}' : '{"type":"error","error":{"type":"invalid_request_error","message":"no"}}');
     });
     await new Promise<void>((r) => anthropic.listen(0, '127.0.0.1', r));
@@ -245,6 +246,7 @@ describe('server: primary profile on the wire', () => {
     sent.length = 0;
     status = 200;
     fails = 1;
+    second = 200;
   });
 
   const turn = (session: string, messages: unknown[] = [user('refatora esse modulo')], requestClass = 'main') =>
@@ -288,6 +290,20 @@ describe('server: primary profile on the wire', () => {
     assert.deepEqual(sent.map((b) => b.model), [SONNET, OPUS]);
 
     const next = await turn('W3', [user('refatora esse modulo'), assistantText, user('continua')]);
+    await next.body.text();
+    assert.equal(sent[2].model, SONNET);
+  });
+
+  it('keeps the profile when the original resend fails (5xx): that says nothing about the rewrite', async () => {
+    status = 400;
+    fails = 1;
+    second = 529;
+    const res = await turn('W5');
+    await res.body.text();
+    assert.equal(res.statusCode, 529);
+    assert.deepEqual(sent.map((b) => b.model), [SONNET, OPUS]);
+
+    const next = await turn('W5', [user('refatora esse modulo'), assistantText, user('continua')]);
     await next.body.text();
     assert.equal(sent[2].model, SONNET);
   });
