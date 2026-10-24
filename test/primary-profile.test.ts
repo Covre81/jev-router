@@ -299,6 +299,18 @@ describe('server: primary profile on the wire', () => {
     assert.deepEqual(sent[0].output_config, { effort: 'medium' });
   });
 
+  it('sends light structural work as Sonnet high and records the served profile without diagnostics', async () => {
+    score = { simple: 0.37, standard: 0.31, structural: 0.32 };
+    const res = await turn('W9');
+    await res.body.text();
+    assert.equal(sent[0].model, SONNET);
+    assert.deepEqual(sent[0].output_config, { effort: 'high' });
+    for (let i = 0; i < 50 && rows.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(rows[0]?.model, SONNET);
+    assert.equal(rows[0]?.requestedModel, OPUS);
+    assert.equal(rows[0]?.effort, 'high');
+  });
+
   it('resends the original request once when Anthropic refuses the rewritten one', async () => {
     status = 400;
     const res = await turn('W2');

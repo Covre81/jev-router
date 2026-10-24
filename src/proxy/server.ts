@@ -280,7 +280,6 @@ export function buildServer({
             maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
             thinkingType: typeof body['thinking'] === 'object' && body['thinking'] ? (body['thinking'] as any).type : undefined,
             thinkingBudget: typeof body['thinking'] === 'object' && body['thinking'] ? (body['thinking'] as any).budget_tokens : undefined,
-            effort: effortOverride ?? (typeof body['output_config'] === 'object' && body['output_config'] ? (body['output_config'] as any).effort : undefined),
           };
         } catch (err) {
           req.log.warn({ err }, 'diagnostics capture failed');
@@ -293,6 +292,7 @@ export function buildServer({
         requestClass: single(req.headers, 'x-claude-code-request-class'),
         model: route === 'primary' ? (modelOverride ?? base.body!.model) : route === 'gemini' ? config.gemini?.model : route === 'cursor' ? config.cursor?.model : (modelOverride ?? cheapModel),
         requestedModel: base.body!.model,
+        effort: effortOverride ?? (base.body!['output_config'] as { effort?: string } | undefined)?.effort,
         toolsOffered: Array.isArray(base.body!['tools']) ? base.body!['tools'].length : 0,
         quotaUtilization: quota?.current()?.utilization,
         diagnostics,

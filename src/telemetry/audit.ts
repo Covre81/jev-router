@@ -14,6 +14,8 @@ export interface ExchangeContext {
   readonly requestClass: string | undefined;
   readonly model: string | undefined;
   readonly requestedModel: string | undefined;
+  /** `output_config.effort` that went out (the primary profile's when one was applied). */
+  readonly effort?: string | undefined;
   /** Size of `body.tools`: a cheap answer that used none of them is an inspection miss. */
   readonly toolsOffered: number;
   /** Binding Claude quota window when the exchange was routed. */
@@ -30,7 +32,6 @@ export interface ExchangeContext {
     maxTokens?: number | undefined;
     thinkingType?: string | undefined;
     thinkingBudget?: number | undefined;
-    effort?: string | undefined;
   } | undefined;
   readonly upstream?: {
     status?: number;
@@ -253,7 +254,7 @@ function record(
     maxTokens: ctx.diagnostics?.maxTokens ?? null,
     thinkingType: ctx.diagnostics?.thinkingType ?? null,
     thinkingBudget: ctx.diagnostics?.thinkingBudget ?? null,
-    effort: ctx.diagnostics?.effort ?? null,
+    effort: ctx.effort ?? null,
     cacheWrite5mTokens: result.usage?.cacheWrite5mTokens ?? null,
     cacheWrite1hTokens: result.usage?.cacheWrite1hTokens ?? null,
     upstreamStatus: ctx.upstream?.status ?? null,
