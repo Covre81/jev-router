@@ -105,22 +105,67 @@ export interface PrimaryProfile {
   readonly effort: Effort;
 }
 
+export type EscalationReason =
+  | 'gemini-failed'
+  | 'escalated-from-gemini'
+  | 'gemini-busy'
+  | 'gemini-unhealthy'
+  | 'context';
+
+export const BUMP_LADDER: readonly PrimaryProfile[] = [
+  { model: 'claude-sonnet-5-5', effort: 'low' },
+  { model: 'claude-sonnet-5-5', effort: 'medium' },
+  { model: 'claude-sonnet-5-5', effort: 'high' },
+  { model: 'claude-sonnet-5-5', effort: 'xhigh' },
+  { model: 'claude-opus-5-5', effort: 'medium' },
+  { model: 'claude-opus-5-5', effort: 'high' },
+  { model: 'claude-opus-5-5', effort: 'xhigh' },
+];
+
+function bumpLadder(profile: PrimaryProfile): PrimaryProfile {
+  const idx = BUMP_LADDER.findIndex((p) => p.model === profile.model && p.effort === profile.effort);
+  if (idx === -1) return profile;
+  return BUMP_LADDER[Math.min(idx + 1, BUMP_LADDER.length - 1)] ?? profile;
+}
+
 /**
  * Which Claude serves a conversation that lands on primary. Sonnet 5.5 costs
  * half of Opus 5.5 on every token kind (input, cache write, cache read,
  * output), so it takes work JEV does not call structural, and light
- * structural work (0.3-0.45) at high effort instead of Opus medium. xhigh/max are never
- * picked: they only spend more; a user's /effort still passes through.
+ * structural work (0.3-0.45) at high effort instead of Opus medium.
+ * Opus xhigh is picked for hard-risk structural work or via escalation bump;
+ * max is never picked (only a user's explicit /effort passes through).
  */
 // ponytail: bars are judgment, not tuned; move them to PolicyOptions once telemetry shows where they sit
 export function primaryProfile(
   d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
+  escalation?: EscalationReason,
 ): PrimaryProfile {
-  if (hardRiskVeto(d) || d.structural >= 0.6) return { model: 'claude-opus-5-5', effort: 'high' };
-  if (d.structural >= 0.45) return { model: 'claude-opus-5-5', effort: 'medium' };
-  if (d.structural >= 0.3) return { model: 'claude-sonnet-5-5', effort: 'high' };
-  if (d.simple >= 0.6) return { model: 'claude-sonnet-5-5', effort: 'low' };
-  return { model: 'claude-sonnet-5-5', effort: 'medium' };
+  let base: PrimaryProfile;
+  if (hardRiskVeto(d) && d.structural >= 0.6) {
+    base = { model: 'claude-opus-5-5', effort: 'xhigh' };
+  } else if (hardRiskVeto(d) || d.structural >= 0.6) {
+    base = { model: 'claude-opus-5-5', effort: 'high' };
+  } else if (d.structural >= 0.45 || (d.riskScores?.requires_inspection ?? 0) >= 0.5) {
+    base = { model: 'claude-opus-5-5', effort: 'medium' };
+  } else if (d.structural >= 0.3) {
+    base = { model: 'claude-sonnet-5-5', effort: 'high' };
+  } else if (d.simple >= 0.6) {
+    base = { model: 'claude-sonnet-5-5', effort: 'low' };
+  } else {
+    base = { model: 'claude-sonnet-5-5', effort: 'medium' };
+  }
+
+  if (escalation === 'gemini-failed' || escalation === 'escalated-from-gemini') {
+    return bumpLadder(base);
+  }
+  if (escalation === 'context') {
+    if (d.simple >= 0.6) {
+      return { model: 'claude-opus-5-5', effort: 'low' };
+    }
+    return base;
+  }
+  return base;
 }
 
 /**
@@ -160,4 +205,3 @@ export function geminiEligible(
   if (d.textOnly === undefined) return false;
   return d.textOnly >= bar;
 }
-

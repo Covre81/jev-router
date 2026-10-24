@@ -4,7 +4,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type { Dispatcher } from 'undici';
 import type { BuildInfo } from '../build-info.js';
 import type { Config } from '../config.js';
-import { hardRiskVeto, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
+import { hardRiskVeto, type EscalationReason, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
 import type { CheapState } from '../providers/cheap-health.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
@@ -162,14 +162,15 @@ export function buildServer({
     // Unparseable → let Anthropic return its canonical validation error.
     if (!base.body || !base.rawBody) return relay(reply, await sendPrimary(base));
 
-    const decision = await router.decide({
+    const context = {
       body: base.body,
       rawByteLength: base.rawBody.length,
       sessionId: single(req.headers, 'x-claude-code-session-id'),
       agentId: single(req.headers, 'x-claude-code-agent-id'),
       requestClass: single(req.headers, 'x-claude-code-request-class'),
       contextCompacted: single(req.headers, 'x-claude-code-context-compacted') !== undefined,
-    });
+    };
+    const decision = await router.decide(context);
 
     const standard = decision.tier === 'standard' && providers.standard !== undefined;
     const cheapProvider = standard ? providers.standard! : providers.cheap;
@@ -402,19 +403,27 @@ export function buildServer({
       // Cascade advance from a fallback-loop continuation: Cursor -> Gemini -> cheap -> primary (one-off, never pinned).
       if (await serveGeminiOrCheap('failover:cursor-unavailable', () => doSendCheapWithRetry(cheapProvider, cheapReq))) return reply;
       router.clearFallbackLoop(decision, 'primary');
-      const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
+      const routeDec: RouteDecision = await router.profileForFallback(
+        { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' },
+        context,
+        'gemini-failed',
+      );
       return relayClaude(base, routeDec);
     }
 
     if (decision.route === 'gemini') {
-      const fallbackToPrimary = async (reason: RouteReason) => {
+      const fallbackToPrimary = async (reason: RouteReason, escalation: EscalationReason) => {
         router.clearGeminiLoop(decision, 'primary');
-        const routeDec: RouteDecision = { ...decision, route: 'primary', reason };
+        const routeDec: RouteDecision = await router.profileForFallback(
+          { ...decision, route: 'primary', reason },
+          context,
+          escalation,
+        );
         // base, not activeBase: the Gemini handoff in the system prompt would rewrite Claude's cache.
         return relayClaude(base, routeDec);
       };
 
-      const doFallback = async (reason: RouteReason) => {
+      const doFallback = async (reason: RouteReason, escalation: EscalationReason) => {
         if (decision.fallbackLoop) {
           // Cascade continuation: Gemini -> cheap -> primary one-off (never pinToPrimary from a cascade continuation).
           const resCheap = await doSendCheapWithRetry(cheapProvider, cheapReq);
@@ -424,16 +433,20 @@ export function buildServer({
             return relay(reply, resCheap, routeDec, req, exchange('cheap'));
           }
           router.clearFallbackLoop(decision, 'primary');
-          const routeDec: RouteDecision = { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' };
+          const routeDec: RouteDecision = await router.profileForFallback(
+            { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' },
+            context,
+            'gemini-failed',
+          );
           return relayClaude(base, routeDec);
         }
 
         if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
-          return fallbackToPrimary(reason);
+          return fallbackToPrimary(reason, escalation);
         }
 
         if (cheapHealth?.state === 'down') {
-          return fallbackToPrimary(reason);
+          return fallbackToPrimary(reason, escalation);
         }
 
         router.clearGeminiLoop(decision, decision.fallbackTier);
@@ -445,21 +458,26 @@ export function buildServer({
         }
 
         router.pinToPrimary(decision);
-        return fallbackToPrimary('failover:cheap-unavailable');
+        return fallbackToPrimary('failover:cheap-unavailable', 'gemini-failed');
       };
 
       if (!providers.gemini || !geminiBreaker || geminiBreaker.state === 'open') {
         upstreamFailureState = { failure: 'skipped' };
-        return doFallback('skipped:gemini-unhealthy');
+        return doFallback('skipped:gemini-unhealthy', 'gemini-unhealthy');
       }
 
       if (!geminiBreaker.acquire()) {
         upstreamFailureState = { failure: 'skipped' };
         // Busy is momentary (another session holds the slot): Claude serves this turn only, the session stays on Gemini.
         if (!decision.fallbackLoop && decision.fallbackTier === 'primary') {
-          return relayClaude(base, { ...decision, route: 'primary', reason: 'skipped:gemini-busy' });
+          const routeDec = await router.profileForFallback(
+            { ...decision, route: 'primary', reason: 'skipped:gemini-busy' },
+            context,
+            'gemini-busy',
+          );
+          return relayClaude(base, routeDec);
         }
-        return doFallback('skipped:gemini-busy');
+        return doFallback('skipped:gemini-busy', 'gemini-busy');
       }
 
       let outcome: 'success' | 'failure' | 'neutral' = 'failure';
@@ -479,7 +497,9 @@ export function buildServer({
         upstreamFailureState = { failure: failureCode(res.reason) };
         const statusMatch = res.reason.match(/^HTTP (\d+)/);
         if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-        return await doFallback('failover:gemini-unavailable');
+        const escalation: EscalationReason =
+          res.reason === 'aborted' || isRoutingMiss ? 'gemini-unhealthy' : 'gemini-failed';
+        return await doFallback('failover:gemini-unavailable', escalation);
       } finally {
         geminiBreaker.release(outcome);
       }

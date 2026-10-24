@@ -84,7 +84,7 @@ const Env = z
     GEMINI_TIER_PRESSURE_MIN_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.6),
     GEMINI_TIER_FROM_PRIMARY: bool.default(true),
     GEMINI_TIER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
-    GEMINI_TIER_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(200_000),
+    GEMINI_TIER_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(3_200_000),
     GEMINI_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     GEMINI_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
     GEMINI_TIER_HOME: z.string().optional(), // defaults to <jevHome()>/agy-home in loadConfig

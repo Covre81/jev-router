@@ -39,7 +39,7 @@ describe('Gemini tier unit tests', () => {
       assert.equal(c.gemini.pressureMinTextOnly, 0.6);
       assert.equal(c.gemini.fromPrimary, true);
       assert.equal(c.gemini.maxConcurrency, 1);
-      assert.equal(c.gemini.maxPromptChars, 200000);
+      assert.equal(c.gemini.maxPromptChars, 3200000);
       assert.equal(c.gemini.breakerFailures, 3);
       assert.equal(c.gemini.breakerCooldownMs, 300000);
       assert.equal(c.gemini.home, join('/jev-home', 'agy-home'));
