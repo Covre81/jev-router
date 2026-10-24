@@ -136,6 +136,8 @@ export interface GeminiPolicyOptions {
   readonly enabled: boolean;
   readonly minTextOnly: number;
   readonly pressureMinTextOnly: number;
+  /** Cheap route off: Gemini serves trivial/standard work itself, tools included, with no text-only bar. */
+  readonly replacesCheap?: boolean;
 }
 
 export function geminiEligible(
@@ -145,6 +147,8 @@ export function geminiEligible(
   quotaLevel: 'none' | 'pressure' | 'critical'
 ): boolean {
   if (!opts.enabled) return false;
+  // selectTier already ran the risk veto: a trivial/standard proposal is never risky.
+  if (opts.replacesCheap && (proposedTier === 'trivial' || proposedTier === 'standard')) return true;
   if (proposedTier !== 'primary') return false;
   const hardRisk = d.riskScores
     ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)

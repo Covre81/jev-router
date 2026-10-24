@@ -2,7 +2,7 @@ import type { MessagesBody } from '../../routing/messages-body.js';
 
 const SYSTEM_REMINDER = /<system-reminder>([\s\S]*?)<\/system-reminder>/g;
 const ENV_OR_HANDOFF_BLOCK = /<(?:env|session_handoff)>[\s\S]*?<\/(?:env|session_handoff)>/g;
-const MAX_TOOLS_SECTION_CHARS = 16_000;
+const MAX_TOOLS_SECTION_CHARS = 32_000;
 
 function extractSystemEnv(system: unknown): string {
   if (!system) return '';
@@ -21,6 +21,25 @@ function extractSystemEnv(system: unknown): string {
   return matches.join('\n\n') + '\n\n';
 }
 
+/** Keys that cost chars without telling the model how to shape an input. */
+const SCHEMA_NOISE = new Set(['description', '$schema', 'additionalProperties', 'title', 'examples']);
+
+/** The whole JSON schema (nesting, enums, array items) minus prose: a flattened one hides the shape of nested inputs. */
+function compactSchema(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(compactSchema);
+  if (!node || typeof node !== 'object') return node;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(node)) {
+    // Under `properties` the keys are field names: a field called "description" must survive.
+    if (k === 'properties' && v && typeof v === 'object' && !Array.isArray(v)) {
+      out[k] = Object.fromEntries(Object.entries(v).map(([name, sub]) => [name, compactSchema(sub)]));
+    } else if (!SCHEMA_NOISE.has(k)) {
+      out[k] = compactSchema(v);
+    }
+  }
+  return out;
+}
+
 function renderClientTools(tools: unknown[]): string {
   const lines: string[] = [
     'Available Client Tools (emit <jev_tool_use>{"name":"ToolName","input":{...}}</jev_tool_use> to call):',
@@ -35,19 +54,7 @@ function renderClientTools(tools: unknown[]): string {
       typeof t.description === 'string'
         ? t.description.replace(/\s+/g, ' ').trim().slice(0, 220)
         : '';
-    let schemaStr = '{}';
-    if (t.input_schema && typeof t.input_schema === 'object') {
-      const s = t.input_schema as { properties?: Record<string, any>; required?: string[] };
-      const props: Record<string, string> = {};
-      if (s.properties && typeof s.properties === 'object') {
-        for (const [k, v] of Object.entries(s.properties)) {
-          const pType = v && typeof v === 'object' && typeof v.type === 'string' ? v.type : 'any';
-          const req = Array.isArray(s.required) && s.required.includes(k) ? ' (required)' : '';
-          props[k] = `${pType}${req}`;
-        }
-      }
-      schemaStr = JSON.stringify(props);
-    }
+    const schemaStr = t.input_schema && typeof t.input_schema === 'object' ? JSON.stringify(compactSchema(t.input_schema)) : '{}';
     const line = `- ${t.name}: ${desc} | input: ${schemaStr}`;
     if (totalChars + line.length + 1 > MAX_TOOLS_SECTION_CHARS) break;
     lines.push(line);

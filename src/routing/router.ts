@@ -93,6 +93,8 @@ export interface RouterOptions {
   readonly readFirstStandard?: boolean;
   /** Let JEV pick Claude model + effort per session (PRIMARY_PROFILES). */
   readonly primaryProfiles?: boolean;
+  /** false = no cheap provider (CHEAP_ROUTE=off): trivial/standard work Gemini cannot take goes to primary. */
+  readonly cheapRoute?: boolean;
 }
 
 const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = { trivial: 0, standard: 1, primary: 2 };
@@ -339,7 +341,9 @@ export class Router {
     const classifierMs = Math.round(performance.now() - started);
 
     // The risk veto runs inside selectTier, before any bar: no quota level moves a risky turn.
-    const proposed = selectTier(distribution, policy);
+    const scored = selectTier(distribution, policy);
+    const cheapOff = this.options.cheapRoute === false;
+    const proposed: Tier = cheapOff && scored !== 'primary' ? 'primary' : scored;
     const extra = { distribution, classifierMs };
 
     if (loopActive) {
@@ -379,7 +383,7 @@ export class Router {
 
     let isGeminiEligible = false;
     if (this.options.geminiPolicy && !hasImageDocumentOrToolChoice(ctx.body)) {
-      const effectiveProposedForGemini = classifyForGemini ? 'primary' : proposed;
+      const effectiveProposedForGemini = classifyForGemini ? 'primary' : scored;
       isGeminiEligible = geminiEligible(distribution, effectiveProposedForGemini, this.options.geminiPolicy, level);
     }
     
@@ -418,7 +422,7 @@ export class Router {
         return resolve('standard', 'read-first:standard', extra);
       }
       let lowered = false;
-      if (policy !== this.options.policy) {
+      if (policy !== this.options.policy && !cheapOff) {
         const normalProposed = selectTier(distribution, this.options.policy);
         // gemini/cursor are transient tiers, not escalation ranks (mirrors policy.ts TIER_RANK).
         const ranked = (t: Tier): t is Exclude<Tier, 'gemini' | 'cursor'> => t !== 'gemini' && t !== 'cursor';
