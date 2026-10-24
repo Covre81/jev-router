@@ -1,6 +1,6 @@
 import type { Classification, ComplexityClassifier } from '../classifier/classifier.js';
 import type { ComplexityDistribution } from '../domain/complexity.js';
-import { selectTier, stickyTier, tierRoute, geminiEligible, hardRiskVeto, primaryProfile, type PolicyOptions, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
+import { selectTier, stickyTier, tierRoute, geminiEligible, hardRiskVeto, primaryProfile, type EscalationReason, type PolicyOptions, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
 import {
   conversationFingerprint,
   estimateInputTokens,
@@ -59,6 +59,7 @@ export interface RouteDecision {
   readonly primaryProfile?: PrimaryProfile;
   /** JEV score behind a profile picked outside routing (compaction): telemetry only, the risk veto re-classifies. */
   readonly profileScore?: Classification;
+  readonly escalationReason?: EscalationReason;
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -169,31 +170,112 @@ export class Router {
     let profile = this.profiles.get(key);
     let profileScore: Classification | undefined;
     const opening =
-      isFreshConversation(ctx.body) || ctx.contextCompacted || dec.previousTier === 'trivial' || dec.previousTier === 'standard';
+      isFreshConversation(ctx.body) ||
+      ctx.contextCompacted ||
+      dec.previousTier === 'trivial' ||
+      dec.previousTier === 'standard' ||
+      dec.previousTier === 'gemini' ||
+      dec.previousTier === 'cursor';
+    let escalation: EscalationReason | undefined;
     if (profile === undefined && dec.route === 'primary' && opening) {
-      if (!dec.distribution && ctx.contextCompacted) profileScore = await this.classifyForProfile(ctx);
+      if (!dec.distribution) profileScore = await this.classifyForProfile(ctx.body, ctx.rawByteLength);
       const distribution = dec.distribution ?? profileScore;
       if (distribution) {
-        profile = primaryProfile(distribution);
+        escalation =
+          dec.reason === 'escalated:context'
+            ? 'context'
+            : dec.previousTier === 'gemini'
+              ? 'escalated-from-gemini'
+              : undefined;
+        profile = primaryProfile(distribution, escalation);
         // ponytail: unbounded like lastServedTier; one small entry per session
         this.profiles.set(key, profile);
       }
     }
     // The compaction pick carries its score so telemetry records why that model was chosen.
-    return profile ? { ...dec, ...(profileScore && { profileScore }), primaryProfile: profile } : dec;
+    return profile
+      ? {
+          ...dec,
+          ...(profileScore && { profileScore }),
+          primaryProfile: profile,
+          ...(escalation && { escalationReason: escalation }),
+        }
+      : dec;
+  }
+
+  /**
+   * Assigns or resolves a primaryProfile for fallback / escalation paths to Claude.
+   * Reuses the stored session profile if one exists; otherwise computes from distribution
+   * (or classifies for profile if missing, failure => returns dec unchanged).
+   * Stores the profile for the session except for 'gemini-busy'.
+   */
+  async profileForFallback(
+    dec: RouteDecision,
+    ctxOrDistribution: RequestContext | MessagesBody | Classification | undefined,
+    reason: EscalationReason,
+  ): Promise<RouteDecision> {
+    if (!this.options.primaryProfiles) return dec;
+    const key = dec.conversationKey;
+    if (!key) return dec;
+
+    if (
+      ctxOrDistribution &&
+      'requestClass' in ctxOrDistribution &&
+      ctxOrDistribution.requestClass &&
+      ctxOrDistribution.requestClass !== 'main'
+    ) {
+      return dec;
+    }
+
+    if (this.profiles.get(key) === null) return dec;
+
+    const stored = dec.primaryProfile ?? this.profiles.get(key);
+    if (stored) {
+      return { ...dec, primaryProfile: stored, escalationReason: reason };
+    }
+
+    let distribution: Classification | undefined = dec.distribution;
+    let profileScore: Classification | undefined;
+
+    if (!distribution && ctxOrDistribution) {
+      if ('simple' in ctxOrDistribution && typeof ctxOrDistribution.simple === 'number') {
+        distribution = ctxOrDistribution as Classification;
+      } else if ('body' in ctxOrDistribution && (ctxOrDistribution as RequestContext).body) {
+        const rc = ctxOrDistribution as RequestContext;
+        distribution = await this.classifyForProfile(rc.body, rc.rawByteLength);
+        profileScore = distribution;
+      } else if ('messages' in ctxOrDistribution && Array.isArray((ctxOrDistribution as MessagesBody).messages)) {
+        distribution = await this.classifyForProfile(ctxOrDistribution as MessagesBody);
+        profileScore = distribution;
+      }
+    }
+
+    if (!distribution) return dec;
+
+    const profile = primaryProfile(distribution, reason);
+    if (reason !== 'gemini-busy') {
+      this.profiles.set(key, profile);
+    }
+
+    return {
+      ...dec,
+      ...(profileScore && { profileScore }),
+      primaryProfile: profile,
+      escalationReason: reason,
+    };
   }
 
   /** pinned:compaction skips JEV for routing; the profile still needs a score. Failure keeps the client default. */
-  private async classifyForProfile(ctx: RequestContext): Promise<Classification | undefined> {
-    const text = latestHumanText(ctx.body);
+  private async classifyForProfile(body: MessagesBody, rawByteLength = 0): Promise<Classification | undefined> {
+    const text = latestHumanText(body);
     if (text === undefined) return undefined;
     try {
       return await this.classifier.classify(
         {
           text: text.slice(0, this.options.classifierMaxChars),
-          turnCount: ctx.body.messages.length,
-          toolCount: Array.isArray(ctx.body['tools']) ? ctx.body['tools'].length : 0,
-          estimatedInputTokens: estimateInputTokens(ctx.rawByteLength),
+          turnCount: body.messages.length,
+          toolCount: Array.isArray(body['tools']) ? body['tools'].length : 0,
+          estimatedInputTokens: estimateInputTokens(rawByteLength),
         },
         AbortSignal.timeout(this.options.classifierTimeoutMs),
       );
