@@ -306,20 +306,79 @@ export function computeStatsByClass(db: TelemetryDb, pricing: Pricing, options: 
     'ORDER BY final_provider, request_class, requested_model'
   ).all(params) as any[];
 
-  return rows.map(r => {
-    let usd = 0;
-    if (r.finalProvider === 'anthropic') {
-      const p = pricing.primary(r.requestedModel !== '?' ? r.requestedModel : null);
-      if (p) {
-        let writeCost = r.cacheWrite * p.input * pricing.cacheWriteMultiplier;
-        if (r.cacheWrite5m != null || r.cacheWrite1h != null) {
-           writeCost = ((r.cacheWrite5m ?? 0) * 1.25 + (r.cacheWrite1h ?? 0) * 2) * p.input;
-        }
-        usd = (Math.max(0, r.tokensIn - r.cacheRead - r.cacheWrite) * p.input + writeCost + r.cacheRead * p.cacheRead + r.tokensOut * p.output) / 1000000;
-      }
-    }
-    return { ...r, usd };
-  });
+  return rows.map(r => ({
+    ...r,
+    usd: r.finalProvider === 'anthropic' ? anthropicUsd(pricing, r.requestedModel !== '?' ? r.requestedModel : null, r) : 0,
+  }));
+}
+
+interface UsageSums {
+  tokensIn?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  tokensOut?: number | null;
+  cacheWrite5m?: number | null;
+  cacheWrite1h?: number | null;
+}
+
+/** Anthropic USD of a usage sum; tokens_in includes cache reads and writes. */
+function anthropicUsd(pricing: Pricing, model: string | null, u: UsageSums): number {
+  const p = pricing.primary(model);
+  if (!p) return 0;
+  const tin = u.tokensIn ?? 0, read = u.cacheRead ?? 0, write = u.cacheWrite ?? 0;
+  const writeCost = u.cacheWrite5m != null || u.cacheWrite1h != null
+    ? ((u.cacheWrite5m ?? 0) * 1.25 + (u.cacheWrite1h ?? 0) * 2) * p.input
+    : write * p.input * pricing.cacheWriteMultiplier;
+  return (Math.max(0, tin - read - write) * p.input + writeCost + read * p.cacheRead + (u.tokensOut ?? 0) * p.output) / 1000000;
+}
+
+/**
+ * Main-loop Claude calls grouped by the profile that served them (model + effort).
+ * A session that changed profile counts once per profile. Priced by the served
+ * model, not the requested one: a Sonnet rewrite costs Sonnet.
+ */
+export function computeProfileStats(db: TelemetryDb, pricing: Pricing, options: StatsOptions = {}) {
+  const rows = db.prepare(
+    'SELECT model, coalesce(effort, \'?\') AS effort, count(*) AS calls, sum(coalesce(tokens_in, 0)) AS tokensIn, ' +
+    '  sum(coalesce(cache_read_tokens, 0)) AS cacheRead, sum(coalesce(cache_write_tokens, 0)) AS cacheWrite, ' +
+    '  sum(coalesce(tokens_out, 0)) AS tokensOut, sum(cache_write_5m_tokens) AS cacheWrite5m, sum(cache_write_1h_tokens) AS cacheWrite1h ' +
+    'FROM router_logs WHERE final_provider = \'anthropic\' AND request_class = \'main\' AND session_id IS NOT NULL ' +
+    '  AND (@since IS NULL OR created_at >= @since) ' +
+    'GROUP BY model, effort, session_id'
+  ).all({ since: options.since?.getTime() ?? null }) as any[];
+
+  type Acc = { model: string; effort: string; calls: number[]; tokensIn: number; cacheRead: number; usd: number };
+  const byProfile = new Map<string, Acc>();
+  for (const r of rows) {
+    const key = `${r.model} ${r.effort}`;
+    const p: Acc = byProfile.get(key) ?? { model: r.model, effort: r.effort, calls: [], tokensIn: 0, cacheRead: 0, usd: 0 };
+    p.calls.push(r.calls);
+    p.tokensIn += r.tokensIn;
+    p.cacheRead += r.cacheRead;
+    p.usd += anthropicUsd(pricing, r.model, r);
+    byProfile.set(key, p);
+  }
+  return [...byProfile.values()].map(({ calls, ...p }) => {
+    const sorted = [...calls].sort((a, b) => a - b);
+    const total = calls.reduce((a, b) => a + b, 0);
+    return {
+      ...p,
+      sessions: calls.length,
+      calls: total,
+      medianCallsPerSession: sorted[Math.floor(sorted.length / 2)]!,
+      meanCallsPerSession: total / calls.length,
+      cacheHitRate: p.tokensIn === 0 ? null : p.cacheRead / p.tokensIn,
+      usdPerSession: p.usd / calls.length,
+    };
+  }).sort((a, b) => b.sessions - a.sessions);
+}
+
+export function renderProfileStats(stats: ReturnType<typeof computeProfileStats>) {
+  if (stats.length === 0) return 'No main-loop Claude calls';
+  return table([
+    ['Model', 'Effort', 'Sessions', 'Calls', 'Median calls/session', 'Mean calls/session', 'Cache hit', 'USD/session'],
+    ...stats.map(s => [s.model, s.effort, fmt(s.sessions), fmt(s.calls), fmt(s.medianCallsPerSession), s.meanCallsPerSession.toFixed(1), pct(s.cacheRead, s.tokensIn), '$' + s.usdPerSession.toFixed(4)]),
+  ]);
 }
 
 export function renderStatsByClass(stats: any[]) {
@@ -449,14 +508,7 @@ export function computeDailyStats(db: TelemetryDb, pricing: Pricing, options: St
     
     let usd = 0;
     if (r.finalProvider === 'anthropic') {
-      const p = pricing.primary(r.requestedModel);
-      if (p) {
-        let writeCost = (r.cacheWrite || 0) * p.input * pricing.cacheWriteMultiplier;
-        if (r.cacheWrite5m != null || r.cacheWrite1h != null) {
-           writeCost = ((r.cacheWrite5m ?? 0) * 1.25 + (r.cacheWrite1h ?? 0) * 2) * p.input;
-        }
-        usd = (Math.max(0, (r.tokensIn || 0) - (r.cacheRead || 0) - (r.cacheWrite || 0)) * p.input + writeCost + (r.cacheRead || 0) * p.cacheRead + (r.tokensOut || 0) * p.output) / 1000000;
-      }
+      usd = anthropicUsd(pricing, r.requestedModel, r);
       d.tokensIn += (r.tokensIn || 0);
       d.usd += usd;
     }

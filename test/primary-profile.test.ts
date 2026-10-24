@@ -29,8 +29,16 @@ describe('primaryProfile', () => {
   it('gives structural work Opus high', () => {
     assert.deepEqual(primaryProfile({ simple: 0.03, standard: 0.12, structural: 0.85 }), { model: OPUS, effort: 'high' });
   });
-  it('leaves mixed work on the client default (Opus medium)', () => {
-    assert.deepEqual(primaryProfile({ simple: 0.37, standard: 0.31, structural: 0.32 }), { model: OPUS, effort: 'medium' });
+  it('gives light structural work (0.3-0.45) Sonnet high', () => {
+    assert.deepEqual(primaryProfile({ simple: 0.37, standard: 0.31, structural: 0.32 }), { model: SONNET, effort: 'high' });
+    assert.deepEqual(primaryProfile({ simple: 0.2, standard: 0.36, structural: 0.44 }), { model: SONNET, effort: 'high' });
+  });
+  it('switches from Sonnet high to Opus at the 0.45 and 0.6 bars', () => {
+    assert.deepEqual(primaryProfile({ simple: 0.2, standard: 0.35, structural: 0.45 }), { model: OPUS, effort: 'medium' });
+    assert.deepEqual(primaryProfile({ simple: 0.1, standard: 0.3, structural: 0.6 }), { model: OPUS, effort: 'high' });
+  });
+  it('keeps risky light structural work on Opus high, not Sonnet high', () => {
+    assert.deepEqual(primaryProfile({ simple: 0.37, standard: 0.31, structural: 0.32, risk: 0.9 }), { model: OPUS, effort: 'high' });
   });
   it('sends standard work to Sonnet medium', () => {
     assert.deepEqual(primaryProfile({ simple: 0.4, standard: 0.5, structural: 0.1 }), { model: SONNET, effort: 'medium' });
@@ -289,6 +297,18 @@ describe('server: primary profile on the wire', () => {
     assert.equal(res.statusCode, 200);
     assert.equal(sent[0].model, SONNET);
     assert.deepEqual(sent[0].output_config, { effort: 'medium' });
+  });
+
+  it('sends light structural work as Sonnet high and records the served profile without diagnostics', async () => {
+    score = { simple: 0.37, standard: 0.31, structural: 0.32 };
+    const res = await turn('W9');
+    await res.body.text();
+    assert.equal(sent[0].model, SONNET);
+    assert.deepEqual(sent[0].output_config, { effort: 'high' });
+    for (let i = 0; i < 50 && rows.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(rows[0]?.model, SONNET);
+    assert.equal(rows[0]?.requestedModel, OPUS);
+    assert.equal(rows[0]?.effort, 'high');
   });
 
   it('resends the original request once when Anthropic refuses the rewritten one', async () => {
