@@ -455,6 +455,10 @@ export function buildServer({
 
       if (!geminiBreaker.acquire()) {
         upstreamFailureState = { failure: 'skipped' };
+        // Busy is momentary (another session holds the slot): Claude serves this turn only, the session stays on Gemini.
+        if (!decision.fallbackLoop && decision.fallbackTier === 'primary') {
+          return relayClaude(base, { ...decision, route: 'primary', reason: 'skipped:gemini-busy' });
+        }
         return doFallback('skipped:gemini-busy');
       }
 
