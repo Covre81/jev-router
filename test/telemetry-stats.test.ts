@@ -8,7 +8,7 @@ import { inTransaction, openTelemetryDb } from '../src/telemetry/db.js';
 import { SqliteTelemetry } from '../src/telemetry/recorder.js';
 import { MIGRATIONS, recordQuota, type NewRouterLog } from '../src/telemetry/schema.js';
 import { pricingFromEnv } from '../src/telemetry/pricing.js';
-import { computeStats, parseSince, renderStats } from '../src/telemetry/stats.js';
+import { computeProfileStats, computeStats, parseSince, renderProfileStats, renderStats } from '../src/telemetry/stats.js';
 
 const row = (over: Partial<NewRouterLog>): NewRouterLog => ({
   createdAt: new Date('2026-10-01T12:00:00Z'),
@@ -62,6 +62,31 @@ describe('telemetry → stats', () => {
     assert.match(text, /Estimated Anthropic tokens saved\s+1,750/);
     assert.match(text, /NET \((PROFIT|LOSS)\)/);
     assert.match(text, /Cheap provider priced at \$0/);
+    await sink.close();
+  });
+
+  it('groups main-loop calls per session by served profile, priced by the served model', async () => {
+    const db = openTelemetryDb(':memory:');
+    const sink = new SqliteTelemetry(db, { flushIntervalMs: 60_000 });
+    const sonnetHigh = { model: 'claude-sonnet-5-5', requestedModel: 'claude-opus-5-5', effort: 'high', requestClass: 'main', tokensIn: 1000, cacheReadTokens: 800, tokensOut: 10 };
+    const opusMedium = { model: 'claude-opus-5-5', requestedModel: 'claude-opus-5-5', effort: 'medium', requestClass: 'main', tokensIn: 1000, cacheReadTokens: 500, tokensOut: 10 };
+    for (let i = 0; i < 3; i++) sink.record(row({ ...sonnetHigh, sessionId: 'A:main' }));
+    sink.record(row({ ...opusMedium, sessionId: 'B:main' }));
+    sink.record(row({ ...opusMedium, sessionId: 'C:main' }));
+    sink.record(row({ ...opusMedium, sessionId: 'C:main' }));
+    sink.record(row({ ...opusMedium, sessionId: 'C:sub', requestClass: 'subagent' }));
+    sink.record(row({ ...sonnetHigh, sessionId: 'A:main', finalProvider: 'openai' }));
+    sink.flush();
+
+    const stats = computeProfileStats(db, pricingFromEnv({}));
+    const opus = stats.find((s) => s.model === 'claude-opus-5-5')!;
+    const sonnet = stats.find((s) => s.model === 'claude-sonnet-5-5')!;
+    assert.equal(stats.length, 2);
+    assert.deepEqual([opus.effort, opus.sessions, opus.calls, opus.medianCallsPerSession, opus.meanCallsPerSession], ['medium', 2, 3, 2, 1.5]);
+    assert.deepEqual([sonnet.effort, sonnet.sessions, sonnet.calls, sonnet.cacheHitRate], ['high', 1, 3, 0.8]);
+    const sonnetCall = (200 * 2 + 800 * 0.1 + 10 * 10) / 1_000_000;
+    assert.ok(Math.abs(sonnet.usdPerSession - 3 * sonnetCall) < 1e-12, 'Sonnet rewrite priced as Sonnet, not the requested Opus');
+    assert.match(renderProfileStats(stats), /claude-sonnet-5-5\s+high/);
     await sink.close();
   });
 

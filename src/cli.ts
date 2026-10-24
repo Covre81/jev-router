@@ -23,6 +23,7 @@ Options:
   --db <file>      stats: telemetry database (default: TELEMETRY_DB_PATH or ~/.jev-router/telemetry.db)
   --since <span>   stats: only the last <n>h / <n>d / <n>m (e.g. 24h, 7d)
   --json           stats: machine-readable output
+  --by-profile     stats: main-loop calls per session, cache hit and USD by served model + effort
                    statusline: {"text","level"}, level ok | warn | critical
 
 Variables already set in the shell win over the env file.`;
@@ -40,6 +41,7 @@ async function main(argv: string[]): Promise<number> {
       'cache-misses': { type: 'boolean', default: false },
       'min-write': { type: 'string' },
       daily: { type: 'boolean', default: false },
+      'by-profile': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -117,6 +119,9 @@ async function main(argv: string[]): Promise<number> {
           }
           const stats = statsModule.computeCacheMisses(db, pricing, missOpts);
           console.log(values.json ? JSON.stringify(stats, null, 2) : statsModule.renderCacheMisses(stats));
+        } else if (values['by-profile']) {
+          const stats = statsModule.computeProfileStats(db, pricing, opts);
+          console.log(values.json ? JSON.stringify(stats, null, 2) : statsModule.renderProfileStats(stats));
         } else if (values.daily) {
           const stats = statsModule.computeDailyStats(db, pricing, opts);
           console.log(values.json ? JSON.stringify(stats, null, 2) : statsModule.renderDailyStats(stats));
