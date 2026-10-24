@@ -326,6 +326,47 @@ describe('Gemini Tier E2E', () => {
     }
   });
 
+  it('busy serves Claude once and keeps the session on Gemini (regression: busy pinned it to Claude)', async () => {
+    const { proxy, url } = await createTestServer({ GEMINI_TIER: 'on' });
+    try {
+      spawnQueue.push(() => {
+        const slow = new EventEmitter() as any;
+        slow.stdin = new Writable({ write(c, e, cb) { cb(); } });
+        slow.stdout = new EventEmitter();
+        slow.stderr = new EventEmitter();
+        slow.pid = 304;
+        setTimeout(() => {
+          slow.stdout.emit('data', Buffer.from(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'slow', usage: {} } }) + '\n'));
+          slow.emit('close', 0);
+        }, 200);
+        return slow;
+      });
+      const send = (session: string, messages: any[]) =>
+        request(`${url}/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-claude-code-session-id': session },
+          body: JSON.stringify({ model: 'claude', messages }),
+        });
+      const p1 = send('holder', [{ role: 'user', content: 'a' }]);
+      await new Promise((r) => setTimeout(r, 20));
+      const r2 = await send('other', [{ role: 'user', content: 'b' }]);
+      assert.equal(r2.headers['x-jev-route'], 'primary; reason=skipped:gemini-busy');
+      await r2.body.text();
+      await (await p1).body.text();
+
+      const loop = await send('other', [
+        { role: 'user', content: 'b' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+      ]);
+      assert.equal(loop.headers['x-jev-route'], 'gemini; reason=sticky');
+      await loop.body.text();
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
   it('telemetry', async () => {
     const { proxy, url } = await createTestServer({ GEMINI_TIER: 'on' });
     try {

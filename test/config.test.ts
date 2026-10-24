@@ -61,3 +61,17 @@ describe('removedEnvSet', () => {
     assert.deepEqual(removedEnvSet({}), []);
   });
 });
+
+describe('CHEAP_ROUTE', () => {
+  it('is off by default and then needs no CHEAP_API_KEY', () => {
+    assert.equal(loadConfig(base).cheapRoute, false);
+    const { CHEAP_API_KEY: _, ...noKey } = base as Record<string, string>;
+    assert.equal(loadConfig(noKey).cheapRoute, false);
+  });
+
+  it('requires CHEAP_API_KEY when on', () => {
+    const { CHEAP_API_KEY: _, ...noKey } = base as Record<string, string>;
+    assert.throws(() => loadConfig({ ...noKey, CHEAP_ROUTE: 'on' }), /CHEAP_API_KEY/);
+    assert.equal(loadConfig({ ...base, CHEAP_ROUTE: 'on' }).cheapRoute, true);
+  });
+});

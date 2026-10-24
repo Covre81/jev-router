@@ -8,6 +8,7 @@ import type { Tier } from './domain/policy.js';
 import { AnthropicProvider } from './providers/anthropic.js';
 import { CheapHealth } from './providers/cheap-health.js';
 import { OpenAICompatibleProvider } from './providers/openai/provider.js';
+import type { Provider } from './providers/provider.js';
 import { QuotaStore } from './quota.js';
 import { buildServer } from './proxy/server.js';
 import { Router } from './routing/router.js';
@@ -26,6 +27,8 @@ import { CircuitBreaker } from './providers/breaker.js';
 // conversation is treated as unknown and goes primary: savings lost, never
 // correctness. Raise it only if `stats` shows that under heavy parallel use.
 const SESSION_MAX_ENTRIES = 10_000;
+
+const cheapRouteOff: Provider = { name: 'cheap-off', send: async () => ({ kind: 'unavailable', reason: 'cheap route off' }) };
 
 /** Input tokens a cheap model can take: 90% of its window minus the reserved output. */
 const inputBudget = (contextTokens: number, maxOutputTokens: number) => Math.floor(contextTokens * 0.9) - maxOutputTokens;
@@ -81,7 +84,8 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       policy: {
         minCheapProbability: config.router.minCheapProbability,
         standardRoute: config.router.standardRoute,
-        standardEnabled: config.cheapStandard !== undefined,
+        // Cheap route off: standard work is still proposed, for Gemini to take.
+        standardEnabled: config.cheapStandard !== undefined || !config.cheapRoute,
         minStandardProbability: config.router.minStandardProbability,
       },
       primaryClasses: config.router.primaryClasses,
@@ -108,12 +112,14 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
               enabled: true,
               minTextOnly: geminiConfig.minTextOnly,
               pressureMinTextOnly: geminiConfig.pressureMinTextOnly,
+              replacesCheap: !config.cheapRoute,
             },
             geminiFromPrimary: geminiConfig.fromPrimary,
           }
         : {}),
-      readFirstStandard: config.cheapReadFirstHint && config.readFirstStandard && config.cheapStandard !== undefined,
+      readFirstStandard: config.cheapRoute && config.cheapReadFirstHint && config.readFirstStandard && config.cheapStandard !== undefined,
       primaryProfiles: config.primaryProfiles,
+      cheapRoute: config.cheapRoute,
     },
   );
 
@@ -126,9 +132,10 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
 
   const providers = {
     primary: new AnthropicProvider(config.primary),
-    cheap: new OpenAICompatibleProvider(config.cheap),
+    // Cheap route off: the router never picks it; cascade steps that try it fall through to the next tier.
+    cheap: config.cheapRoute ? new OpenAICompatibleProvider(config.cheap) : cheapRouteOff,
     // Same endpoint and key, bigger model: the health check covers both tiers.
-    ...(config.cheapStandard
+    ...(config.cheapRoute && config.cheapStandard
       ? { standard: new OpenAICompatibleProvider({ ...config.cheap, model: config.cheapStandard.model }) }
       : {}),
     ...(geminiConfig
@@ -139,7 +146,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       : {}),
   };
 
-  const cheapHealth = config.cheapHealth.enabled
+  const cheapHealth = config.cheapRoute && config.cheapHealth.enabled
     ? new CheapHealth({
         baseUrl: config.cheap.baseUrl,
         apiKey: config.cheap.apiKey,

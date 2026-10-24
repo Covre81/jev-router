@@ -38,7 +38,9 @@ const Env = z
     CLASSIFIER_MAX_CHARS: z.coerce.number().int().positive().default(4_000),
 
     CHEAP_BASE_URL: z.url().default('http://127.0.0.1:11434/v1'),
-    CHEAP_API_KEY: z.string().min(1),
+    // Ollama cheap route (trivial + standard tiers). Off: Gemini (agy) takes that work, Claude the rest.
+    CHEAP_ROUTE: z.enum(['off', 'on']).default('off'),
+    CHEAP_API_KEY: z.string().min(1).optional(),
     CHEAP_MODEL: z.string().min(1).default('gpt-oss:20b-cloud'),
     CHEAP_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8_192),
     CHEAP_CONTEXT_TOKENS: z.coerce.number().int().positive().default(131_072),
@@ -101,6 +103,9 @@ const Env = z
     }
     if (env.CONTROL_PORT === 0 && env.PORT === 65_535) {
       ctx.addIssue({ code: 'custom', path: ['CONTROL_PORT'], message: 'PORT is 65535: set CONTROL_PORT explicitly' });
+    }
+    if (env.CHEAP_ROUTE === 'on' && !env.CHEAP_API_KEY) {
+      ctx.addIssue({ code: 'custom', path: ['CHEAP_API_KEY'], message: 'required when CHEAP_ROUTE=on' });
     }
     if (env.CLASSIFIER === 'jev' && !env.TYPESAFE_API_KEY) {
       ctx.addIssue({ code: 'custom', path: ['TYPESAFE_API_KEY'], message: 'required when CLASSIFIER=jev' });
@@ -176,9 +181,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       apiKey: e.ANTHROPIC_API_KEY,
       timeoutMs: e.UPSTREAM_TIMEOUT_MS,
     },
+    cheapRoute: e.CHEAP_ROUTE === 'on',
     cheap: {
       baseUrl: trimSlash(e.CHEAP_BASE_URL),
-      apiKey: e.CHEAP_API_KEY,
+      apiKey: e.CHEAP_API_KEY ?? '', // empty only when CHEAP_ROUTE=off (superRefine)
       model: e.CHEAP_MODEL,
       maxOutputTokens: e.CHEAP_MAX_OUTPUT_TOKENS,
       contextTokens: e.CHEAP_CONTEXT_TOKENS,

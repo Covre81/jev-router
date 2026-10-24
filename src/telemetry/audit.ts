@@ -241,7 +241,8 @@ function record(
     fallbackTriggered: decision.reason.startsWith('failover:'),
     toolsOffered: ctx.toolsOffered,
     toolCalls: result.toolCalls,
-    inspectionMiss: cheap ? result.outcome === 'ok' && ctx.toolsOffered > 0 && result.toolCalls === 0 && ctx.humanText !== undefined && !isAcknowledgement(ctx.humanText) && !result.endsWithQuestion : null,
+    // Gemini serves the cheap route's work: the same answered-without-looking check applies.
+    inspectionMiss: cheap || decision.route === 'gemini' ? result.outcome === 'ok' && ctx.toolsOffered > 0 && result.toolCalls === 0 && ctx.humanText !== undefined && !isAcknowledgement(ctx.humanText) && !result.endsWithQuestion : null,
     quotaUtilization: ctx.quotaUtilization ?? null,
     ccSessionId: ctx.diagnostics?.ccSessionId ?? null,
     agentType: ctx.diagnostics?.agentType ?? null,

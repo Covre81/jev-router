@@ -102,6 +102,14 @@ describe('Gemini tier unit tests', () => {
       assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.8 }, 'primary', opts, 'none'), true);
       assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.65 }, 'primary', opts, 'pressure'), true);
 
+      // Cheap route off: Gemini takes trivial/standard work itself, tools included, no text-only bar.
+      const replacing = { ...opts, replacesCheap: true };
+      assert.equal(geminiEligible({ simple: 0.95, standard: 0.05, structural: 0 }, 'trivial', replacing, 'none'), true);
+      assert.equal(geminiEligible({ simple: 0.4, standard: 0.5, structural: 0.1, textOnly: 0.1 }, 'standard', replacing, 'none'), true);
+      // Structural work still needs the text-only bar to leave Claude.
+      assert.equal(geminiEligible({ simple: 0, standard: 0, structural: 1, textOnly: 0.1 }, 'primary', replacing, 'none'), false);
+      assert.equal(geminiEligible({ simple: 0.95, standard: 0, structural: 0 }, 'trivial', { ...replacing, enabled: false }, 'none'), false);
+
       // Tool-enabled mode (minTextOnly=0): allows requires_inspection >= 0.5 and low textOnly, blocks only hardRisk >= 0.5
       const toolOpts = { enabled: true, minTextOnly: 0, pressureMinTextOnly: 0 };
       assert.equal(
@@ -474,7 +482,47 @@ describe('Gemini tier unit tests', () => {
       assert.ok(!prompt.includes('LONG SYSTEM PROMPT'));
       assert.ok(prompt.includes('<env>\nWorking directory: C:\\Dev\\JEV-APP-PC\n</env>'));
       assert.ok(prompt.includes('Available Client Tools'));
-      assert.ok(prompt.includes('- Read: Reads a file from the local filesystem. | input: {"file_path":"string (required)","limit":"number"}'));
+      assert.ok(prompt.includes('- Read: Reads a file from the local filesystem. | input: {"type":"object","properties":{"file_path":{"type":"string"},"limit":{"type":"number"}},"required":["file_path"]}'));
+    });
+
+    it('renders nested tool schemas whole, minus prose (regression: TodoWrite items were flattened to "array")', () => {
+      const body = {
+        tools: [
+          {
+            name: 'TodoWrite',
+            description: 'Writes the todo list.',
+            input_schema: {
+              $schema: 'http://json-schema.org/draft-07/schema#',
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                todos: {
+                  type: 'array',
+                  description: 'The updated todo list',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      content: { type: 'string' },
+                      status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                      description: { type: 'string', description: 'a field named description' },
+                    },
+                    required: ['content', 'status'],
+                  },
+                },
+              },
+              required: ['todos'],
+            },
+          },
+        ],
+        messages: [{ role: 'user', content: 'plan it' }],
+      } as any;
+      const prompt = renderGeminiPrompt(body, 200000)!;
+      assert.ok(
+        prompt.includes(
+          '- TodoWrite: Writes the todo list. | input: {"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"description":{"type":"string"}},"required":["content","status"]}}},"required":["todos"]}',
+        ),
+      );
+      assert.ok(!prompt.includes('$schema') && !prompt.includes('The updated todo list'));
     });
   });
 
