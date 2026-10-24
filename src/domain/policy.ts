@@ -108,7 +108,8 @@ export interface PrimaryProfile {
 /**
  * Which Claude serves a conversation that lands on primary. Sonnet 5.5 costs
  * half of Opus 5.5 on every token kind (input, cache write, cache read,
- * output), so it takes work JEV does not call structural. xhigh/max are never
+ * output), so it takes work JEV does not call structural, and light
+ * structural work (0.3-0.45) at high effort instead of Opus medium. xhigh/max are never
  * picked: they only spend more; a user's /effort still passes through.
  */
 // ponytail: bars are judgment, not tuned; move them to PolicyOptions once telemetry shows where they sit
@@ -116,7 +117,8 @@ export function primaryProfile(
   d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
 ): PrimaryProfile {
   if (hardRiskVeto(d) || d.structural >= 0.6) return { model: 'claude-opus-5-5', effort: 'high' };
-  if (d.structural >= 0.3) return { model: 'claude-opus-5-5', effort: 'medium' };
+  if (d.structural >= 0.45) return { model: 'claude-opus-5-5', effort: 'medium' };
+  if (d.structural >= 0.3) return { model: 'claude-sonnet-5-5', effort: 'high' };
   if (d.simple >= 0.6) return { model: 'claude-sonnet-5-5', effort: 'low' };
   return { model: 'claude-sonnet-5-5', effort: 'medium' };
 }
