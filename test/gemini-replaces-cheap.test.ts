@@ -45,6 +45,7 @@ describe('Gemini replaces the cheap route', () => {
     const loop = await decide([user('leia a.ts'), toolUse, toolResult]);
     assert.equal(loop.route, 'gemini');
     assert.equal(loop.reason, 'sticky');
+    assert.equal(loop.fallbackTier, 'primary', 'a failed loop step goes to Claude, never to the cheap slot');
   });
 
   it('standard work goes to Gemini, never to a cheap tier', async () => {
