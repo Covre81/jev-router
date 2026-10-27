@@ -91,7 +91,7 @@ describe('New defaults', () => {
     assert.equal(config.argon.modelHigh, 'gemini-4-argon-high');
 
     assert.equal(config.cursorCoding, true);
-    assert.equal(config.cursorCodingMaxTextOnly, 0.5);
+    assert.equal(config.cursorCodingMaxTextOnly, 0.75);
     assert.equal(config.cursorCodingMinMass, 0.5);
 
     assert.equal(config.timeouts.firstByteMs, 60_000);

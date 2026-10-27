@@ -54,7 +54,7 @@ describe('Cursor coding inside Argon tier', () => {
         simple: 0.1,
         standard: 0.3,
         structural: 0.3,
-        textOnly: CURSOR_CODING_MAX_TEXT_ONLY, // 0.5
+        textOnly: CURSOR_CODING_MAX_TEXT_ONLY, // 0.75
       };
       assert.equal(isCodingTurn(dBoundary), false);
 
