@@ -54,7 +54,7 @@ function textOfAssistant(ev: any): string {
   return typeof ev?.text === 'string' ? ev.text : '';
 }
 
-function toolKind(ev: any): string {
+export function toolKind(ev: any): string {
   const tc = ev?.tool_call ?? ev?.toolCall;
   if (tc && typeof tc === 'object') {
     const key = Object.keys(tc)[0];
@@ -164,7 +164,7 @@ export async function runCursorAgent(
         if (!ev || typeof ev !== 'object') return;
         if (isToolStarted(ev)) {
           // The prompt is delivered as workspace/prompt.md (argv is capped on Windows): reading it is expected.
-          if (isPromptFileRead(ev)) return;
+          if (isPromptFileRead(ev) || isHarmlessCursorTool(ev)) return;
           toolAttempted = toolKind(ev);
           if (child.pid !== undefined) killTree(child.pid);
           return;
@@ -248,6 +248,46 @@ export async function runCursorAgent(
   } finally {
     try { await rm(workspaceDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+
+/**
+ * Harmless Cursor agent tools allowed during execution because they have no side
+ * effects outside Cursor's own session state (such as internal planning/todo lists
+ * and discovery of available MCP tools without executing them).
+ *
+ * Allowed tools:
+ * - "update todos" (updateTodosToolCall): updates internal session todo state
+ * - "todo write" (todoWriteToolCall): writes session todo item
+ * - "read todos" (readTodosToolCall): reads session todo state
+ * - "todo read" (todoReadToolCall): reads session todo item
+ * - "get mcp tools" (getMcpToolsToolCall): lists available MCP tools without calling them
+ * - "list mcp tools" (listMcpToolsToolCall): lists available MCP tools without calling them
+ *
+ * All other tools remain strictly blocked (shell/terminal execution, file edit/write,
+ * arbitrary file reads, actual MCP tool invocation, web search/fetch, etc.).
+ */
+const harmlessToolsSet = new Set<string>([
+  'update todos',
+  'todo write',
+  'read todos',
+  'todo read',
+  'get mcp tools',
+  'list mcp tools',
+]);
+
+export const CURSOR_HARMLESS_TOOLS: ReadonlySet<string> = harmlessToolsSet;
+
+/**
+ * True when a tool call has no external side effects outside Cursor's internal session
+ * (todo management, listing available MCP tools).
+ * Matches on the normalised toolKind (exact match, case-insensitive), never substring.
+ */
+export function isHarmlessCursorTool(ev: unknown): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const raw = toolKind(ev as any);
+  const normalized = raw.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  return CURSOR_HARMLESS_TOOLS.has(normalized);
 }
 
 /** True when a tool event only reads the delivered prompt.md (the temp-file prompt channel). */
