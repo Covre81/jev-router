@@ -235,11 +235,6 @@ export async function runCursorAgent(
         const text = (typeof finalResult.result === 'string' && finalResult.result.trim() ? finalResult.result : segmentText || aggregateText).trim();
         if (!text) return settle({ ok: false, reason: 'empty' });
 
-        const quotaParsed = parseQuotaError(text);
-        if (quotaParsed) {
-          return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
-        }
-
         settle({
           ok: true,
           text,

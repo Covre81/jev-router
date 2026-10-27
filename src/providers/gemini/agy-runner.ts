@@ -68,6 +68,7 @@ export async function runAgy(
     let stdoutBuffer = '';
     let stderrText = '';
     let textDelta = '';
+    let errorEventText = '';
     let firstByteReceived = false;
 
     return await new Promise<AgyResult>((resolve) => {
@@ -149,6 +150,9 @@ export async function runAgy(
               }
             } else if (ev.event === 'result' && ev.result) {
               finalResult = ev.result;
+            } else if (ev.event === 'error' || ev.event === 'status') {
+              const msg = ev.error ?? ev.message ?? ev.status;
+              if (typeof msg === 'string') errorEventText = (errorEventText + ' ' + msg).slice(-1000);
             }
           } catch {}
         }
@@ -177,17 +181,20 @@ export async function runAgy(
           return settle({ ok: false, reason: 'aborted' });
         }
 
-        // Check for quota error in any of the error outputs
-        const errCandidate = [
-          finalResult?.error,
-          finalResult?.response,
-          textDelta,
-          stderrText,
-        ].filter(Boolean).join(' ');
-
-        const quotaParsed = parseQuotaError(errCandidate);
-        if (quotaParsed) {
-          return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+        // Quota is read ONLY from genuine error channels (error events, result error on a
+        // non-success run, stderr). Never from the model's answer: a reply about rate
+        // limiters must not be mistaken for an exhausted quota.
+        const succeeded = code === 0 && finalResult?.status === 'SUCCESS';
+        if (!succeeded) {
+          const errCandidate = [
+            errorEventText,
+            finalResult?.status !== 'SUCCESS' ? finalResult?.error : undefined,
+            stderrText,
+          ].filter(Boolean).join(' ');
+          const quotaParsed = parseQuotaError(errCandidate);
+          if (quotaParsed) {
+            return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+          }
         }
 
         if (code !== 0) {
@@ -209,11 +216,6 @@ export async function runAgy(
           return settle({ ok: false, reason: 'empty' });
         }
 
-        const quotaInResponse = parseQuotaError(responseText);
-        if (quotaInResponse) {
-          return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaInResponse.resetAt } });
-        }
-        
         settle({
           ok: true,
           text: finalResult.response || textDelta,

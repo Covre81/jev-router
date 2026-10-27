@@ -40,6 +40,8 @@ export interface ServerDeps {
   readonly geminiBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly argonBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly cursorBreaker?: import('../providers/breaker.js').CircuitBreaker;
+  /** Log destination override (tests capture hop logs); default is stdout. */
+  readonly logStream?: NodeJS.WritableStream;
   readonly timeouts?: {
     readonly firstByteMs?: number;
     readonly idleMs?: number;
@@ -158,12 +160,13 @@ export function buildServer({
   geminiBreaker,
   argonBreaker,
   cursorBreaker,
+  logStream,
   timeouts,
 }: ServerDeps): FastifyInstance {
   const startedAt = new Date().toISOString();
 
   const app = Fastify({
-    logger: { level: config.logLevel },
+    logger: logStream ? { level: config.logLevel, stream: logStream } : { level: config.logLevel },
     bodyLimit: config.bodyLimitBytes,
     exposeHeadRoutes: false,
   });
@@ -293,7 +296,7 @@ export function buildServer({
 
     let upstreamFailureState: { failure?: string; status?: number; rateLimitHeaders?: string } | undefined;
 
-    const logHopFailure = (hop: 'flash' | 'argon' | 'cursor' | 'claude', rawReason: string, durationMs: number) => {
+    const logHopFailure = (hop: 'flash' | 'argon' | 'agy-claude' | 'cursor' | 'claude', rawReason: string, durationMs: number) => {
       const code = failureCode(rawReason);
       req.log.warn({ hop, reason: code, detail: rawReason.slice(0, 200), ms: Math.round(durationMs) }, 'hop failed');
     };
@@ -574,7 +577,7 @@ export function buildServer({
           res = await providers.gemini.send({ ...r, modelOverride: mappedModel });
         } catch (err) {
           const rawReason = err instanceof Error ? err.message : String(err);
-          logHopFailure('flash', rawReason, performance.now() - hopStart);
+          logHopFailure('agy-claude', rawReason, performance.now() - hopStart);
           upstreamFailureState = { failure: failureCode(rawReason) };
           return { kind: 'failed', reason: rawReason };
         }
@@ -586,13 +589,13 @@ export function buildServer({
           outcome = 'neutral';
           const resetAt = res.quota?.resetAt ?? (Date.now() + QUOTA_DEFAULT_COOLDOWN_MS);
           quotaState.markExhausted(mappedModel, resetAt, res.reason);
-          logHopFailure('flash', `quota (${mappedModel})`, performance.now() - hopStart);
+          logHopFailure('agy-claude', `quota (${mappedModel})`, performance.now() - hopStart);
           return { kind: 'quota', resetAt };
         }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
         const overBudget = res.reason === 'transcript budget exceeded';
         if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
-        logHopFailure('flash', res.reason, performance.now() - hopStart);
+        logHopFailure('agy-claude', res.reason, performance.now() - hopStart);
         upstreamFailureState = { failure: failureCode(res.reason) };
         return { kind: 'failed', reason: res.reason };
       } finally {

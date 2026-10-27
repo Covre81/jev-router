@@ -2,13 +2,14 @@ export const QUOTA_DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 const QUOTA_ERROR_PATTERNS: readonly (string | RegExp)[] = [
   /individual quota reached/i,
-  /\bquota\b/i,
-  /\brate limit\b/i,
-  /\bresource exhausted\b/i,
-  /\b429\b/,
+  /\bquota (?:exceeded|reached)\b/i,
+  /exceeded your current quota/i,
+  /\bresource[_ ]exhausted\b/i,
+  /\brate limit (?:exceeded|reached)\b/i,
+  /\b(?:http|status|error)\s*:?\s*429\b/i,
+  /\b429 too many requests\b/i,
   /\busage limit\b/i,
-  /you(?:'ve| have) hit your/i,
-  /upgrade your (?:plan|subscription)/i,
+  /you(?:'ve| have) hit your (?:\w+ )?limit/i,
   /out of credits/i,
 ];
 
