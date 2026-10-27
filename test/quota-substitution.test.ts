@@ -614,6 +614,51 @@ describe('Quota Substitution Ladder', () => {
     assert.equal(primaryBody.output_config?.effort, 'high');
   });
 
+  it('9b. agy-claude hop failures log hop "agy-claude" (never "flash")', async () => {
+    const now = 1000;
+    const quotaState = new ModelQuotaState(() => now);
+    quotaState.markExhausted('gemini-4-argon-high', now + 100_000, 'quota');
+
+    const lines: string[] = [];
+    const logStream = { write: (s: string) => { lines.push(s); } } as unknown as NodeJS.WritableStream;
+
+    const fakeGemini: Provider = {
+      name: 'gemini-cli',
+      send: async () => ({ kind: 'unavailable', reason: 'quota', quota: { resetAt: now + 100_000 } }),
+    };
+
+    const app = buildServer({
+      config: baseConfig,
+      router: createRouter('argon', 'high'),
+      providers: { primary: { name: 'p', send: async () => okResult() }, gemini: fakeGemini },
+      quotaState,
+      geminiBreaker: new CircuitBreaker(5, 60_000, 2),
+      argonBreaker: new CircuitBreaker(5, 60_000, 2),
+      logStream,
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      headers: { 'content-type': 'application/json' },
+      payload: {
+        model: 'claude-opus-5-5',
+        output_config: { effort: 'medium' },
+        messages: [{ role: 'user', content: 'say hi' }],
+      },
+    });
+    assert.equal(res.statusCode, 200);
+
+    const hopLogs = lines
+      .flatMap((l) => l.split('\n'))
+      .filter((l) => l.includes('hop failed'))
+      .map((l) => JSON.parse(l));
+    const agyHop = hopLogs.find((h) => h.detail === 'quota (claude-opus-5-5-high)');
+    assert.ok(agyHop, `expected agy-claude hop log, got ${JSON.stringify(hopLogs)}`);
+    assert.equal(agyHop.hop, 'agy-claude');
+    assert.ok(!hopLogs.some((h) => h.hop === 'flash'));
+  });
+
   it('10. Cursor quota-exhausted -> coding turn routes to Argon chain', async () => {
     let now = 1000;
     const quotaState = new ModelQuotaState(() => now);

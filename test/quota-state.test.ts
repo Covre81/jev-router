@@ -38,7 +38,7 @@ describe('parseQuotaError', () => {
   });
 
   it('parses short reset durations (Resets in 2h, resets in 45m)', () => {
-    const res2h = parseQuotaError('quota reached. Resets in 2h', baseTime);
+    const res2h = parseQuotaError('quota exceeded. Resets in 2h', baseTime);
     assert.ok(res2h);
     assert.equal(res2h.resetAt, baseTime + 2 * 3600 * 1000);
 
@@ -58,12 +58,15 @@ describe('parseQuotaError', () => {
   it('falls back to default 6h cooldown when no duration or date is found', () => {
     const patterns = [
       'Individual quota reached',
-      'Rate limit reached',
-      'Resource exhausted',
+      'Rate limit exceeded',
+      'You exceeded your current quota, please check your plan',
+      'RESOURCE_EXHAUSTED',
+      'resource_exhausted: too many tokens',
       'HTTP 429 Too Many Requests',
+      'status: 429',
+      "You've hit your usage limit",
       'You have hit your usage limit',
       "You've hit your daily limit",
-      'Please upgrade your plan to increase limits',
       'You are out of credits',
     ];
     for (const pat of patterns) {
@@ -77,6 +80,18 @@ describe('parseQuotaError', () => {
     assert.equal(parseQuotaError('SyntaxError: unexpected token'), null);
     assert.equal(parseQuotaError('Connection refused: ECONNREFUSED'), null);
     assert.equal(parseQuotaError('timeout waiting for process'), null);
+  });
+
+  it('does not match bare words (quota / rate limit / 429) in ordinary prose', () => {
+    const prose = [
+      'A rate limit protects the API; the token bucket is one way to implement a rate limiter.',
+      'Set the quota per tenant and check the 429 handling in your client.',
+      'Port 4290 and item 429 are unrelated.',
+      'Please upgrade your plan if you want more features.',
+    ];
+    for (const text of prose) {
+      assert.equal(parseQuotaError(text), null, `Unexpected match for: ${text}`);
+    }
   });
 });
 
