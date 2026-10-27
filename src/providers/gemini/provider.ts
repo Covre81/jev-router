@@ -123,6 +123,10 @@ export interface GeminiCliProviderOptions {
   readonly timeoutMs: number;
   readonly firstByteTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
+  /** Models that get the Argon no-output limits below instead of the Flash ones. */
+  readonly argonModels?: readonly string[];
+  readonly argonFirstByteTimeoutMs?: number;
+  readonly argonIdleTimeoutMs?: number;
   readonly home: string;
   readonly maxPromptChars: number;
   readonly spawnFn?: SpawnAgy;
@@ -144,12 +148,13 @@ export class GeminiCliProvider implements Provider {
     }
 
     const effectiveModel = req.modelOverride ?? this.opts.model;
+    const isArgon = this.opts.argonModels?.includes(effectiveModel) ?? false;
     const runnerOpts: AgyRunnerOptions = {
       bin: this.opts.bin,
       model: effectiveModel,
       timeoutMs: this.opts.timeoutMs,
-      firstByteTimeoutMs: this.opts.firstByteTimeoutMs,
-      idleTimeoutMs: this.opts.idleTimeoutMs,
+      firstByteTimeoutMs: isArgon ? (this.opts.argonFirstByteTimeoutMs ?? this.opts.firstByteTimeoutMs) : this.opts.firstByteTimeoutMs,
+      idleTimeoutMs: isArgon ? (this.opts.argonIdleTimeoutMs ?? this.opts.idleTimeoutMs) : this.opts.idleTimeoutMs,
       home: this.opts.home,
       signal: req.signal,
     };

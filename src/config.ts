@@ -71,6 +71,9 @@ const Env = z
     ARGON_MODEL_LOW: z.string().default('gemini-4-argon-low'),
     ARGON_MODEL_MEDIUM: z.string().default('gemini-4-argon-medium'),
     ARGON_MODEL_HIGH: z.string().default('gemini-4-argon-high'),
+    // Argon reasons silently for long stretches: its own no-output limits (Flash/Cursor keep TIER_*).
+    ARGON_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+    ARGON_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
     CURSOR_TIER: z.enum(['off', 'on']).default('off'),
     CURSOR_TIER_BIN: z.string().optional(),
     CURSOR_TIER_MODEL: z.string().default('auto'),
@@ -207,6 +210,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       modelLow: e.ARGON_MODEL_LOW,
       modelMedium: e.ARGON_MODEL_MEDIUM,
       modelHigh: e.ARGON_MODEL_HIGH,
+      firstByteMs: e.ARGON_FIRST_BYTE_TIMEOUT_MS,
+      idleMs: e.ARGON_IDLE_TIMEOUT_MS,
     },
     cursor:
       e.CURSOR_TIER === 'off'

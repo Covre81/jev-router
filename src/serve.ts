@@ -120,6 +120,9 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
             ...geminiConfig,
             firstByteTimeoutMs: config.timeouts.firstByteMs,
             idleTimeoutMs: config.timeouts.idleMs,
+            argonModels: [config.argon.modelLow, config.argon.modelMedium, config.argon.modelHigh],
+            argonFirstByteTimeoutMs: config.argon.firstByteMs,
+            argonIdleTimeoutMs: config.argon.idleMs,
           }),
         }
       : {}),
