@@ -260,7 +260,7 @@ export function buildServer({
 
     const logHopFailure = (hop: 'flash' | 'argon' | 'cursor' | 'claude', rawReason: string, durationMs: number) => {
       const code = failureCode(rawReason);
-      req.log.warn({ hop, reason: code, ms: Math.round(durationMs) }, 'hop failed');
+      req.log.warn({ hop, reason: code, detail: rawReason.slice(0, 200), ms: Math.round(durationMs) }, 'hop failed');
     };
 
     const exchange = (route: Route, modelOverride?: string, effortOverride?: string): ExchangeContext => {

@@ -156,6 +156,8 @@ export async function runCursorAgent(
       const handleEvent = (ev: any) => {
         if (!ev || typeof ev !== 'object') return;
         if (isToolStarted(ev)) {
+          // The prompt is delivered as workspace/prompt.md (argv is capped on Windows): reading it is expected.
+          if (isPromptFileRead(ev)) return;
           toolAttempted = toolKind(ev);
           if (child.pid !== undefined) killTree(child.pid);
           return;
@@ -231,4 +233,11 @@ export async function runCursorAgent(
   } finally {
     try { await rm(workspaceDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+/** True when a tool event only reads the delivered prompt.md (the temp-file prompt channel). */
+export function isPromptFileRead(ev: unknown): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (!/read/i.test(toolKind(ev as any))) return false;
+  return /prompt\.md/.test(JSON.stringify(ev));
 }
