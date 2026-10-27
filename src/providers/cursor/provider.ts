@@ -3,18 +3,20 @@ import { anthropicResponseFromCliText } from '../gemini/provider.js';
 import { renderGeminiPrompt } from '../gemini/prompt.js';
 import { runCursorAgent, type CursorRunnerOptions, type SpawnCursor } from './agent-runner.js';
 
+export interface CursorCliProviderOptions {
+  readonly bin: string;
+  readonly model: string;
+  readonly timeoutMs: number;
+  readonly firstByteTimeoutMs?: number;
+  readonly idleTimeoutMs?: number;
+  readonly maxPromptChars: number;
+  readonly spawnFn?: SpawnCursor;
+}
+
 export class CursorCliProvider implements Provider {
   readonly name = 'cursor-cli';
 
-  constructor(
-    private readonly opts: {
-      readonly bin: string;
-      readonly model: string;
-      readonly timeoutMs: number;
-      readonly maxPromptChars: number;
-      readonly spawnFn?: SpawnCursor;
-    },
-  ) {}
+  constructor(private readonly opts: CursorCliProviderOptions) {}
 
   async send(req: ProviderRequest): Promise<ProviderResult> {
     if (!req.body) return { kind: 'unavailable', reason: 'no body' };
@@ -31,6 +33,8 @@ export class CursorCliProvider implements Provider {
       bin: this.opts.bin,
       model: this.opts.model,
       timeoutMs: this.opts.timeoutMs,
+      firstByteTimeoutMs: this.opts.firstByteTimeoutMs,
+      idleTimeoutMs: this.opts.idleTimeoutMs,
       signal: req.signal,
     };
     const res = await runCursorAgent(prompt, runnerOpts, this.opts.spawnFn);

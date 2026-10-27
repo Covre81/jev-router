@@ -16,6 +16,8 @@ export interface ProviderRequest {
   readonly onStreamFailure?: () => void;
   /** Timeout for the headers of this specific request. */
   readonly headersTimeoutMs?: number;
+  /** Optional model override for CLI runners (e.g. Argon low/medium/high). */
+  readonly modelOverride?: string | undefined;
 }
 
 /**

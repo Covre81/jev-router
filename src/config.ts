@@ -37,23 +37,8 @@ const Env = z
     JEV_TIMEOUT_MS: z.coerce.number().int().positive().default(1_500),
     CLASSIFIER_MAX_CHARS: z.coerce.number().int().positive().default(4_000),
 
-    CHEAP_BASE_URL: z.url().default('http://127.0.0.1:11434/v1'),
-    // Ollama cheap route (trivial + standard tiers). Off: Gemini (agy) takes that work, Claude the rest.
-    CHEAP_ROUTE: z.enum(['off', 'on']).default('off'),
-    CHEAP_API_KEY: z.string().min(1).optional(),
-    CHEAP_MODEL: z.string().min(1).default('gpt-oss:20b-cloud'),
-    CHEAP_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8_192),
-    CHEAP_CONTEXT_TOKENS: z.coerce.number().int().positive().default(131_072),
-    CHEAP_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
-    // Standard tier: level-2 work on a bigger cheap model, same CHEAP_BASE_URL. `off` disables it.
-    CHEAP_MODEL_STANDARD: z.string().min(1).default('gemma4:31b-cloud'),
-    CHEAP_STANDARD_CONTEXT_TOKENS: z.coerce.number().int().positive().optional(),
-    CHEAP_HEALTH_ENABLED: bool.default(true),
-    CHEAP_HEALTH_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
-
     ROUTER_MIN_CHEAP_PROBABILITY: z.coerce.number().min(0).max(1).default(0.9),
     ROUTER_MIN_STANDARD_PROBABILITY: z.coerce.number().min(0).max(1).default(0.75),
-    ROUTER_STANDARD_ROUTE: z.enum(['primary', 'cheap']).default('primary'),
     ROUTER_PRIMARY_CLASSES: csv.default(new Set(['auxiliary', 'compaction'])),
     FAILOVER_ON_PRIMARY_RATE_LIMIT: bool.default(true),
 
@@ -62,15 +47,9 @@ const Env = z
     QUOTA_ROUTING: bool.default(true),
     QUOTA_PRESSURE: z.coerce.number().min(0).max(1).default(0.8),
     QUOTA_CRITICAL: z.coerce.number().min(0).max(1).default(0.95),
-    QUOTA_PRESSURE_MIN_CHEAP: z.coerce.number().min(0).max(1).default(0.7),
     QUOTA_PRESSURE_MIN_STANDARD: z.coerce.number().min(0).max(1).default(0.6),
     SESSION_TTL_MS: z.coerce.number().int().positive().default(6 * 60 * 60 * 1000),
 
-    CHEAP_RETRY: bool.default(true),
-    CHEAP_RETRY_DELAY_MS: z.coerce.number().int().min(0).default(250),
-    CHEAP_RETRY_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
-    CHEAP_READ_FIRST_HINT: bool.default(true),
-    CHEAP_READ_FIRST_STANDARD: bool.default(true),
     PRIMARY_PROFILES: bool.default(false),
 
     TELEMETRY_ENABLED: bool.default(true),
@@ -79,7 +58,7 @@ const Env = z
     GEMINI_TIER: z.enum(['off', 'on']).default('off'),
     GEMINI_TIER_BIN: z.string().optional(),
     GEMINI_TIER_MODEL: z.string().default('gemini-3.8-flash-high'),
-    GEMINI_TIER_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+    GEMINI_TIER_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
     GEMINI_TIER_MIN_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.8),
     GEMINI_TIER_PRESSURE_MIN_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.6),
     GEMINI_TIER_FROM_PRIMARY: bool.default(true),
@@ -88,14 +67,24 @@ const Env = z
     GEMINI_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     GEMINI_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
     GEMINI_TIER_HOME: z.string().optional(), // defaults to <jevHome()>/agy-home in loadConfig
+    ARGON_TIER: z.enum(['off', 'on']).default('on'),
+    ARGON_MODEL_LOW: z.string().default('gemini-4-argon-low'),
+    ARGON_MODEL_MEDIUM: z.string().default('gemini-4-argon-medium'),
+    ARGON_MODEL_HIGH: z.string().default('gemini-4-argon-high'),
     CURSOR_TIER: z.enum(['off', 'on']).default('off'),
     CURSOR_TIER_BIN: z.string().optional(),
     CURSOR_TIER_MODEL: z.string().default('auto'),
     CURSOR_TIER_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
-    CURSOR_TIER_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(24_000),
+    CURSOR_TIER_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(200_000),
     CURSOR_TIER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
     CURSOR_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     CURSOR_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
+    CURSOR_CODING: z.enum(['off', 'on']).default('on'),
+    CURSOR_CODING_MAX_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.5),
+    CURSOR_CODING_MIN_MASS: z.coerce.number().min(0).max(1).default(0.5),
+    TIER_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+    TIER_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+    KEEPALIVE_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
   })
   .superRefine((env, ctx) => {
     if (env.QUOTA_CRITICAL < env.QUOTA_PRESSURE) {
@@ -103,9 +92,6 @@ const Env = z
     }
     if (env.CONTROL_PORT === 0 && env.PORT === 65_535) {
       ctx.addIssue({ code: 'custom', path: ['CONTROL_PORT'], message: 'PORT is 65535: set CONTROL_PORT explicitly' });
-    }
-    if (env.CHEAP_ROUTE === 'on' && !env.CHEAP_API_KEY) {
-      ctx.addIssue({ code: 'custom', path: ['CHEAP_API_KEY'], message: 'required when CHEAP_ROUTE=on' });
     }
     if (env.CLASSIFIER === 'jev' && !env.TYPESAFE_API_KEY) {
       ctx.addIssue({ code: 'custom', path: ['TYPESAFE_API_KEY'], message: 'required when CLASSIFIER=jev' });
@@ -138,7 +124,7 @@ export function controlPort(env: NodeJS.ProcessEnv = process.env): number {
   return Number(env['CONTROL_PORT'] || 0) || Number(env['PORT'] || 8787) + 1;
 }
 
-export type Config =Readonly<ReturnType<typeof loadConfig>>;
+export type Config = Readonly<ReturnType<typeof loadConfig>>;
 
 /** Parse once at boot; any misconfiguration kills the process before it listens. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
@@ -167,12 +153,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     port: e.PORT,
     logLevel: e.LOG_LEVEL,
     supervisor: { enabled: e.SUPERVISOR_ENABLED, controlPort: e.CONTROL_PORT || e.PORT + 1, drainMs: e.RELOAD_DRAIN_MS },
-    cheapHealth: { enabled: e.CHEAP_HEALTH_ENABLED, intervalMs: e.CHEAP_HEALTH_INTERVAL_MS },
     quota: {
       enabled: e.QUOTA_ROUTING,
       pressure: e.QUOTA_PRESSURE,
       critical: e.QUOTA_CRITICAL,
-      minCheapProbability: e.QUOTA_PRESSURE_MIN_CHEAP,
       minStandardProbability: e.QUOTA_PRESSURE_MIN_STANDARD,
     },
     primary: {
@@ -181,28 +165,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       apiKey: e.ANTHROPIC_API_KEY,
       timeoutMs: e.UPSTREAM_TIMEOUT_MS,
     },
-    cheapRoute: e.CHEAP_ROUTE === 'on',
-    cheap: {
-      baseUrl: trimSlash(e.CHEAP_BASE_URL),
-      apiKey: e.CHEAP_API_KEY ?? '', // empty only when CHEAP_ROUTE=off (superRefine)
-      model: e.CHEAP_MODEL,
-      maxOutputTokens: e.CHEAP_MAX_OUTPUT_TOKENS,
-      contextTokens: e.CHEAP_CONTEXT_TOKENS,
-      timeoutMs: e.CHEAP_TIMEOUT_MS,
-    },
-    cheapRetry: {
-      enabled: e.CHEAP_RETRY,
-      delayMs: e.CHEAP_RETRY_DELAY_MS,
-      headersTimeoutMs: e.CHEAP_RETRY_HEADERS_TIMEOUT_MS,
-    },
-    cheapReadFirstHint: e.CHEAP_READ_FIRST_HINT,
-    readFirstStandard: e.CHEAP_READ_FIRST_STANDARD,
     primaryProfiles: e.PRIMARY_PROFILES,
-    // undefined = standard tier off: level-2 work stays on the primary (the old behavior).
-    cheapStandard:
-      e.CHEAP_MODEL_STANDARD === 'off'
-        ? undefined
-        : { model: e.CHEAP_MODEL_STANDARD, contextTokens: e.CHEAP_STANDARD_CONTEXT_TOKENS ?? e.CHEAP_CONTEXT_TOKENS },
     proxyAuthToken: e.PROXY_AUTH_TOKEN,
     bodyLimitBytes: e.BODY_LIMIT_BYTES,
     classifier:
@@ -219,7 +182,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     router: {
       minCheapProbability: e.ROUTER_MIN_CHEAP_PROBABILITY,
       minStandardProbability: e.ROUTER_MIN_STANDARD_PROBABILITY,
-      standardRoute: e.ROUTER_STANDARD_ROUTE,
       primaryClasses: e.ROUTER_PRIMARY_CLASSES,
       failoverOnPrimaryRateLimit: e.FAILOVER_ON_PRIMARY_RATE_LIMIT,
       sessionTtlMs: e.SESSION_TTL_MS,
@@ -240,6 +202,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
             breakerCooldownMs: e.GEMINI_TIER_BREAKER_COOLDOWN_MS,
             home: e.GEMINI_TIER_HOME ?? join(jevHome(env), 'agy-home'),
           },
+    argon: {
+      enabled: e.ARGON_TIER === 'on',
+      modelLow: e.ARGON_MODEL_LOW,
+      modelMedium: e.ARGON_MODEL_MEDIUM,
+      modelHigh: e.ARGON_MODEL_HIGH,
+    },
     cursor:
       e.CURSOR_TIER === 'off'
         ? undefined
@@ -252,6 +220,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
             breakerFailures: e.CURSOR_TIER_BREAKER_FAILURES,
             breakerCooldownMs: e.CURSOR_TIER_BREAKER_COOLDOWN_MS,
           },
+    cursorCoding: e.CURSOR_CODING === 'on',
+    cursorCodingMaxTextOnly: e.CURSOR_CODING_MAX_TEXT_ONLY,
+    cursorCodingMinMass: e.CURSOR_CODING_MIN_MASS,
+    timeouts: {
+      firstByteMs: e.TIER_FIRST_BYTE_TIMEOUT_MS,
+      idleMs: e.TIER_IDLE_TIMEOUT_MS,
+      keepaliveIntervalMs: e.KEEPALIVE_INTERVAL_MS,
+    },
     // dbPath is undefined when telemetry is disabled.
     telemetry: { dbPath: e.TELEMETRY_ENABLED ? (e.TELEMETRY_DB_PATH ?? defaultTelemetryDbPath(env)) : undefined, diagnostics: e.TELEMETRY_DIAGNOSTICS },
   };
