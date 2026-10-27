@@ -117,19 +117,25 @@ export function anthropicResponseFromCliText(opts: {
   return { kind: 'response', status: 200, headers, body: Readable.from([JSON.stringify(responseJson)]) };
 }
 
+export interface GeminiCliProviderOptions {
+  readonly bin: string;
+  readonly model: string;
+  readonly timeoutMs: number;
+  readonly firstByteTimeoutMs?: number;
+  readonly idleTimeoutMs?: number;
+  /** Models that get the Argon no-output limits below instead of the Flash ones. */
+  readonly argonModels?: readonly string[];
+  readonly argonFirstByteTimeoutMs?: number;
+  readonly argonIdleTimeoutMs?: number;
+  readonly home: string;
+  readonly maxPromptChars: number;
+  readonly spawnFn?: SpawnAgy;
+}
+
 export class GeminiCliProvider implements Provider {
   readonly name = 'gemini-cli';
 
-  constructor(
-    private readonly opts: {
-      readonly bin: string;
-      readonly model: string;
-      readonly timeoutMs: number;
-      readonly home: string;
-      readonly maxPromptChars: number;
-      readonly spawnFn?: SpawnAgy;
-    }
-  ) {}
+  constructor(private readonly opts: GeminiCliProviderOptions) {}
 
   async send(req: ProviderRequest): Promise<ProviderResult> {
     if (!req.body) {
@@ -141,10 +147,14 @@ export class GeminiCliProvider implements Provider {
       return { kind: 'unavailable', reason: 'transcript budget exceeded' };
     }
 
+    const effectiveModel = req.modelOverride ?? this.opts.model;
+    const isArgon = this.opts.argonModels?.includes(effectiveModel) ?? false;
     const runnerOpts: AgyRunnerOptions = {
       bin: this.opts.bin,
-      model: this.opts.model,
+      model: effectiveModel,
       timeoutMs: this.opts.timeoutMs,
+      firstByteTimeoutMs: isArgon ? (this.opts.argonFirstByteTimeoutMs ?? this.opts.firstByteTimeoutMs) : this.opts.firstByteTimeoutMs,
+      idleTimeoutMs: isArgon ? (this.opts.argonIdleTimeoutMs ?? this.opts.idleTimeoutMs) : this.opts.idleTimeoutMs,
       home: this.opts.home,
       signal: req.signal,
     };
@@ -155,7 +165,11 @@ export class GeminiCliProvider implements Provider {
       return { kind: 'unavailable', reason: res.reason };
     }
 
-    return anthropicResponseFromCliText({ rawText: res.text, usage: res.usage, model: this.opts.model, stream: (req.body as { stream?: unknown }).stream === true });
+    return anthropicResponseFromCliText({
+      rawText: res.text,
+      usage: res.usage,
+      model: effectiveModel,
+      stream: (req.body as { stream?: unknown }).stream === true,
+    });
   }
 }
-

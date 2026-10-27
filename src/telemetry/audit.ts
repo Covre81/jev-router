@@ -221,12 +221,14 @@ function record(
   },
 ): void {
   const cheap = decision.route === 'cheap';
+  // The router names Gemini-served work 'free' (Flash) or 'argon'; only legacy decisions say 'gemini'.
+  const gemini = decision.route === 'gemini' || decision.route === 'free' || decision.route === 'argon';
   sink.record({
     createdAt: new Date(ctx.startedAtMs),
     sessionId: decision.conversationKey ?? null,
     humanPromptHash: promptHash(ctx.humanText),
     jevDecision: jevDecisionOf(decision),
-    finalProvider: decision.route === 'gemini' ? 'gemini' : decision.route === 'cursor' ? 'cursor' : cheap ? 'openai' : 'anthropic',
+    finalProvider: gemini ? 'gemini' : decision.route === 'cursor' ? 'cursor' : cheap ? 'openai' : 'anthropic',
     model: ctx.model ?? null,
     requestedModel: ctx.requestedModel ?? null,
     routeReason: decision.reason,
@@ -242,7 +244,7 @@ function record(
     toolsOffered: ctx.toolsOffered,
     toolCalls: result.toolCalls,
     // Gemini serves the cheap route's work: the same answered-without-looking check applies.
-    inspectionMiss: cheap || decision.route === 'gemini' ? result.outcome === 'ok' && ctx.toolsOffered > 0 && result.toolCalls === 0 && ctx.humanText !== undefined && !isAcknowledgement(ctx.humanText) && !result.endsWithQuestion : null,
+    inspectionMiss: cheap || gemini ? result.outcome === 'ok' && ctx.toolsOffered > 0 && result.toolCalls === 0 && ctx.humanText !== undefined && !isAcknowledgement(ctx.humanText) && !result.endsWithQuestion : null,
     quotaUtilization: ctx.quotaUtilization ?? null,
     ccSessionId: ctx.diagnostics?.ccSessionId ?? null,
     agentType: ctx.diagnostics?.agentType ?? null,

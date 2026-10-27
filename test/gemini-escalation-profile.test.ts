@@ -195,7 +195,7 @@ describe('Router Gemini escalation profile handling', () => {
       new ScriptedClassifier(() => score),
       new TtlLruStore<Tier>(100, 60_000),
       {
-        policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+        policy: { minCheapProbability: 0.9, minStandardProbability: 0.95, argonEnabled: false },
         primaryClasses: new Set(['auxiliary', 'compaction']),
         cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
@@ -207,7 +207,7 @@ describe('Router Gemini escalation profile handling', () => {
 
     // Turn 1 on Gemini
     const t1 = await router.decide(ctx([user('oi')]));
-    assert.equal(t1.route, 'gemini');
+    assert.equal(t1.route, 'free');
 
     // Turn 2: non-text-only (textOnly: 0.1), so escalates to Claude
     score = { simple: 0.4, standard: 0.5, structural: 0.1, textOnly: 0.1 };
@@ -224,7 +224,7 @@ describe('Router Gemini escalation profile handling', () => {
       new ScriptedClassifier(() => ({ simple: 0.4, standard: 0.5, structural: 0.1 })),
       new TtlLruStore<Tier>(100, 60_000),
       {
-        policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+        policy: { minCheapProbability: 0.9, minStandardProbability: 0.95, argonEnabled: false },
         primaryClasses: new Set(),
         cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
@@ -257,7 +257,7 @@ describe('Router Gemini escalation profile handling', () => {
       new ScriptedClassifier(() => ({ simple: 0.4, standard: 0.5, structural: 0.1 })),
       new TtlLruStore<Tier>(100, 60_000),
       {
-        policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+        policy: { minCheapProbability: 0.9, minStandardProbability: 0.95, argonEnabled: false },
         primaryClasses: new Set(),
         cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
@@ -299,7 +299,7 @@ describe('Router Gemini escalation profile handling', () => {
       new ScriptedClassifier(() => ({ simple: 0.4, standard: 0.5, structural: 0.1 })),
       new TtlLruStore<Tier>(100, 60_000),
       {
-        policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+        policy: { minCheapProbability: 0.9, minStandardProbability: 0.95, argonEnabled: false },
         primaryClasses: new Set(),
         cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
@@ -355,6 +355,7 @@ describe('Server-level Gemini escalation on the wire', () => {
       CHEAP_API_KEY: 'test-key',
       LOG_LEVEL: 'fatal',
       GEMINI_TIER: 'on',
+      ARGON_TIER: 'off',
       PRIMARY_PROFILES: 'true',
     });
 
@@ -362,7 +363,7 @@ describe('Server-level Gemini escalation on the wire', () => {
       new ScriptedClassifier(() => ({ simple: 0.4, standard: 0.5, structural: 0.1, textOnly: 0.9 })),
       new TtlLruStore<Tier>(100, 60_000),
       {
-        policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+        policy: { minCheapProbability: 0.9, minStandardProbability: 0.95, argonEnabled: false },
         primaryClasses: new Set(['auxiliary', 'compaction']),
         cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
@@ -403,7 +404,6 @@ describe('Server-level Gemini escalation on the wire', () => {
       router,
       providers: {
         primary: new AnthropicProvider(config.primary),
-        cheap: { send: async () => ({ kind: 'unavailable', reason: 'down' }) } as any,
         gemini: fakeGeminiProvider as any,
       },
       geminiBreaker,

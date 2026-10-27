@@ -4,14 +4,21 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type { Dispatcher } from 'undici';
 import type { BuildInfo } from '../build-info.js';
 import type { Config } from '../config.js';
-import { hardRiskVeto, type EscalationReason, type PrimaryProfile, type Route, type Tier } from '../domain/policy.js';
-import type { CheapState } from '../providers/cheap-health.js';
+import {
+  hardRiskVeto,
+  selectArgonProfile,
+  bumpArgonProfile,
+  type ArgonProfile,
+  type EscalationReason,
+  type PrimaryProfile,
+  type Route,
+  type Tier,
+} from '../domain/policy.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
 import { withPrimaryProfile } from '../routing/primary-profile.js';
-import { needsReadFirstHint, withReadFirstHint, needsReadFirstFollowup, READ_FIRST_FOLLOWUP } from '../routing/read-first-hint.js';
 import type { RouteDecision, RouteReason, Router } from '../routing/router.js';
 import { auditExchange, auditFailure, type ExchangeContext } from '../telemetry/audit.js';
 import { noopTelemetry, type TelemetrySink } from '../telemetry/recorder.js';
@@ -20,20 +27,25 @@ import { forwardableHeaders, presentedCredential, single } from './headers.js';
 export interface ServerDeps {
   readonly config: Config;
   readonly router: Router;
-  /** `standard` serves the standard tier; without it that tier falls back to `cheap`. */
-  readonly providers: Readonly<Record<'cheap' | 'primary', Provider>> & { readonly standard?: Provider | undefined; readonly gemini?: Provider | undefined; readonly cursor?: Provider | undefined };
+  readonly providers: {
+    readonly primary: Provider;
+    readonly gemini?: Provider | undefined;
+    readonly cursor?: Provider | undefined;
+  };
   readonly telemetry?: TelemetrySink;
-  /** Live cheap-provider health; absent = never checked ('unknown'). */
-  readonly cheapHealth?: { readonly state: CheapState };
-  /** The build this process runs; absent when running from src. */
   readonly build?: BuildInfo;
-  /** Fed from every Anthropic response's rate-limit headers; absent = quota routing off. */
   readonly quota?: QuotaStore;
   readonly geminiBreaker?: import('../providers/breaker.js').CircuitBreaker;
+  readonly argonBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly cursorBreaker?: import('../providers/breaker.js').CircuitBreaker;
+  readonly timeouts?: {
+    readonly firstByteMs?: number;
+    readonly idleMs?: number;
+    readonly keepaliveIntervalMs?: number;
+  };
 }
 
-/** Primary statuses that mean "no quota/capacity right now" (opt-in failover to cheap). */
+/** Primary statuses that mean "no quota/capacity right now" (opt-in failover). */
 const PRIMARY_RATE_LIMITED = new Set([429, 529]);
 
 function anthropicError(type: string, message: string) {
@@ -65,6 +77,10 @@ export function failureCode(reason: string): string {
     if (match) return match[0];
   }
   const low = reason.toLowerCase();
+  if (low.includes('first-byte-timeout')) return 'first-byte-timeout';
+  if (low.includes('idle-timeout')) return 'idle-timeout';
+  if (low.includes('empty')) return 'empty';
+  if (low.startsWith('exit')) return 'exit';
   if (low.includes('timeout') || low.includes('deadline')) return 'timeout';
   if (low.startsWith('network:')) return 'network';
   if (low.startsWith('not translatable')) return 'not translatable';
@@ -73,16 +89,60 @@ export function failureCode(reason: string): string {
   return 'other';
 }
 
+class StreamKeepAlive {
+  private timer: NodeJS.Timeout | undefined;
+  private headersFlushed = false;
+
+  constructor(
+    private readonly reply: FastifyReply,
+    private readonly intervalMs: number,
+  ) {}
+
+  start() {
+    this.timer = setInterval(() => {
+      this.sendPing();
+    }, this.intervalMs);
+  }
+
+  sendPing() {
+    if (this.reply.raw.destroyed || this.reply.raw.writableEnded) {
+      this.stop();
+      return;
+    }
+    if (!this.headersFlushed) {
+      this.headersFlushed = true;
+      this.reply.raw.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+    }
+    this.reply.raw.write('event: ping\ndata: {"type": "ping"}\n\n');
+  }
+
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  didSendHeaders(): boolean {
+    return this.headersFlushed || this.reply.raw.headersSent;
+  }
+}
+
 export function buildServer({
   config,
   router,
   providers,
   telemetry = noopTelemetry,
-  cheapHealth,
   build,
   quota,
   geminiBreaker,
+  argonBreaker,
   cursorBreaker,
+  timeouts,
 }: ServerDeps): FastifyInstance {
   const startedAt = new Date().toISOString();
 
@@ -92,7 +152,6 @@ export function buildServer({
     exposeHeadRoutes: false,
   });
 
-  /** Every Anthropic answer carries the quota: read it on the way through, whatever the path. */
   const sendPrimary = async (req: ProviderRequest): Promise<ProviderResult> => {
     const result = await providers.primary.send(req);
     if (result.kind === 'response') {
@@ -118,7 +177,6 @@ export function buildServer({
     return result;
   };
 
-  // Keep every body as raw bytes: primary-bound requests are forwarded byte-for-byte.
   app.removeAllContentTypeParsers();
   app.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
@@ -133,34 +191,37 @@ export function buildServer({
     });
   }
 
-  // Which build answers: a merge that was built but never reloaded shows up here and in the status line.
   app.get('/healthz', async () => ({
     ok: true,
     sha: build?.sha ?? null,
     builtAt: build?.builtAt ?? null,
     startedAt,
     pid: process.pid,
-    cheap: cheapHealth?.state ?? 'unknown',
     quota: quota?.current() ? { ...quota.current(), level: quota.level() } : null,
     gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
+    argon: config.argon.enabled ? { breaker: argonBreaker?.state, inFlight: argonBreaker?.inFlight } : null,
     cursor: config.cursor ? { model: config.cursor.model, breaker: cursorBreaker?.state, inFlight: cursorBreaker?.inFlight } : null,
   }));
-  // Why the main loop's last answer came from where it did: the session-telemetry mod shows it on a model switch.
+
   const lastRoutes = new Map<string, { route: string; reason: string; at: string }>();
   app.get<{ Params: { session: string } }>('/route/:session', async (req, reply) => {
     const last = lastRoutes.get(`${req.params.session}:main`);
     return last ?? reply.code(404).send({ error: 'no decision for this session' });
   });
+
   app.post('/v1/messages', handleMessages);
-  // count_tokens, /v1/models, HEAD /api/hello, … are Anthropic concerns: pass through.
   app.all('*', async (req, reply) => relay(reply, await sendPrimary(providerRequest(req, reply))));
 
   async function handleMessages(req: FastifyRequest, reply: FastifyReply) {
     const startedAt = performance.now();
     const startedAtMs = Date.now();
     const base = providerRequest(req, reply);
-    // Unparseable → let Anthropic return its canonical validation error.
     if (!base.body || !base.rawBody) return relay(reply, await sendPrimary(base));
+
+    const isStreaming = (base.body as { stream?: boolean }).stream === true;
+    const keepaliveInterval = timeouts?.keepaliveIntervalMs ?? config.timeouts?.keepaliveIntervalMs ?? 15_000;
+    const keepAlive = isStreaming ? new StreamKeepAlive(reply, keepaliveInterval) : null;
+    if (keepAlive) keepAlive.start();
 
     const context = {
       body: base.body,
@@ -172,12 +233,7 @@ export function buildServer({
     };
     const decision = await router.decide(context);
 
-    const standard = decision.tier === 'standard' && providers.standard !== undefined;
-    const cheapProvider = standard ? providers.standard! : providers.cheap;
-    const cheapModel = standard ? (config.cheapStandard?.model ?? config.cheap.model) : config.cheap.model;
-
     let activeBase = base;
-    // Never on Claude: it already reads the whole transcript, and a changed system prompt rewrites its prompt cache.
     if (decision.modelTransition && decision.previousTier && decision.tier && decision.tier !== 'primary' && base.body) {
       try {
         const handoffBlock = await buildTransitionHandoff({
@@ -200,60 +256,11 @@ export function buildServer({
       }
     }
 
-    let cheapReq = { ...activeBase };
-    if (decision.route === 'cheap' && config.cheapReadFirstHint && activeBase.body && needsReadFirstHint(activeBase.body)) {
-      const hintedBody = withReadFirstHint(activeBase.body);
-      cheapReq = { ...cheapReq, body: hintedBody, rawBody: Buffer.from(JSON.stringify(hintedBody)) };
-      req.log.info({ conversation: decision.conversationKey }, 'read-first hint added');
-    } else if (decision.route === 'cheap' && config.cheapReadFirstHint && activeBase.body && needsReadFirstFollowup(activeBase.body)) {
-      const hintedBody = withReadFirstHint(activeBase.body, READ_FIRST_FOLLOWUP);
-      cheapReq = { ...cheapReq, body: hintedBody, rawBody: Buffer.from(JSON.stringify(hintedBody)) };
-      req.log.info({ conversation: decision.conversationKey }, 'read-first follow-up added');
-    }
-
     let upstreamFailureState: { failure?: string; status?: number; rateLimitHeaders?: string } | undefined;
 
-    const doSendCheapWithRetry = async (provider: Provider, r: ProviderRequest): Promise<ProviderResult> => {
-      const first = await provider.send(r);
-      if (first.kind === 'response') return first;
-      
-      const fc = failureCode(first.reason);
-      const isRetryable = config.cheapRetry.enabled && !r.signal.aborted && (fc.startsWith('HTTP 5') || fc === 'network' || fc === 'timeout');
-      
-      if (!isRetryable) {
-        upstreamFailureState = { failure: fc };
-        const statusMatch = first.reason.match(/^HTTP (\d+)/);
-        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-        return first;
-      }
-      
-      req.log.info({ reason: fc }, 'cheap provider failed, retrying once');
-      
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(resolve, config.cheapRetry.delayMs);
-          const abort = () => { clearTimeout(timer); reject(new Error('aborted')); };
-          if (r.signal.aborted) return abort();
-          r.signal.addEventListener('abort', abort, { once: true });
-        });
-      } catch (err) {
-        upstreamFailureState = { failure: fc };
-        const statusMatch = first.reason.match(/^HTTP (\d+)/);
-        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-        return first;
-      }
-      
-      const second = await provider.send({ ...r, headersTimeoutMs: config.cheapRetry.headersTimeoutMs });
-      if (second.kind === 'response') {
-        upstreamFailureState = { failure: `retried: ${fc}` };
-        return second;
-      }
-      
-      const finalFc = failureCode(second.reason);
-      upstreamFailureState = { failure: `retried: ${finalFc}` };
-      const statusMatch = second.reason.match(/^HTTP (\d+)/);
-      if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-      return second;
+    const logHopFailure = (hop: 'flash' | 'argon' | 'cursor' | 'claude', rawReason: string, durationMs: number) => {
+      const code = failureCode(rawReason);
+      req.log.warn({ hop, reason: code, detail: rawReason.slice(0, 200), ms: Math.round(durationMs) }, 'hop failed');
     };
 
     const exchange = (route: Route, modelOverride?: string, effortOverride?: string): ExchangeContext => {
@@ -268,7 +275,7 @@ export function buildServer({
           const ccCompaction = single(req.headers, 'x-claude-code-compaction');
           const ccContextCompacted = single(req.headers, 'x-claude-code-context-compacted');
           const compaction = ccCompaction ?? (ccContextCompacted ? `context-compacted:${ccContextCompacted}` : undefined);
-          
+
           diagnostics = {
             ccSessionId: single(req.headers, 'x-claude-code-session-id'),
             agentType: single(req.headers, 'x-claude-code-agent-type'),
@@ -291,9 +298,19 @@ export function buildServer({
         startedAtMs,
         humanText: latestHumanText(base.body!),
         requestClass: single(req.headers, 'x-claude-code-request-class'),
-        model: route === 'primary' ? (modelOverride ?? base.body!.model) : route === 'gemini' ? config.gemini?.model : route === 'cursor' ? config.cursor?.model : (modelOverride ?? cheapModel),
+        model:
+          route === 'primary'
+            ? (modelOverride ?? base.body!.model)
+            : route === 'free' || route === 'gemini'
+              ? (modelOverride ?? config.gemini?.model ?? 'gemini-3.8-flash-high')
+              : route === 'argon'
+                ? (modelOverride ?? config.argon.modelMedium)
+                : (modelOverride ?? config.cursor?.model ?? 'auto'),
         requestedModel: base.body!.model,
-        effort: effortOverride ?? (base.body!['output_config'] as { effort?: string } | undefined)?.effort,
+        // The body's effort is Claude's; flash/cursor have none, argon passes its profile.
+        effort:
+          effortOverride ??
+          (route === 'primary' ? (base.body!['output_config'] as { effort?: string } | undefined)?.effort : undefined),
         toolsOffered: Array.isArray(base.body!['tools']) ? base.body!['tools'].length : 0,
         quotaUtilization: quota?.current()?.utilization,
         diagnostics,
@@ -301,24 +318,21 @@ export function buildServer({
       };
     };
 
-    type CliTier = 'cursor' | 'gemini';
-    /** One breaker-gated attempt on a CLI tier; undefined = unavailable/skipped, caller advances the cascade. */
-    const tryCliTier = async (tier: CliTier, r: ProviderRequest): Promise<ProviderResult | undefined> => {
-      const provider = tier === 'cursor' ? providers.cursor : providers.gemini;
-      const breaker = tier === 'cursor' ? cursorBreaker : geminiBreaker;
+    const tryCursor = async (r: ProviderRequest): Promise<ProviderResult | undefined> => {
+      const provider = providers.cursor;
+      const breaker = cursorBreaker;
       if (!provider || !breaker || breaker.state === 'open') return undefined;
       if (!breaker.acquire()) return undefined;
+      const hopStart = performance.now();
       let outcome: 'success' | 'failure' | 'neutral' = 'failure';
       try {
         let res: ProviderResult;
         try {
           res = await provider.send(r);
         } catch (err) {
-          // A throwing provider is just unavailable: advance the cascade.
-          // Log only the failure code, never raw reason/error text.
-          const failure = failureCode(err instanceof Error ? err.message : String(err));
-          req.log.warn({ failure, conversation: decision.conversationKey }, `${tier} provider unavailable`);
-          upstreamFailureState = { failure };
+          const rawReason = err instanceof Error ? err.message : String(err);
+          logHopFailure('cursor', rawReason, performance.now() - hopStart);
+          upstreamFailureState = { failure: failureCode(rawReason) };
           return undefined;
         }
         if (res.kind === 'response') {
@@ -326,10 +340,9 @@ export function buildServer({
           return res;
         }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
-        // Over-budget is a property of the request, not provider health: it must not open the breaker.
         const overBudget = res.reason === 'transcript budget exceeded';
         if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
-        req.log.warn({ failure: failureCode(res.reason), conversation: decision.conversationKey }, `${tier} provider unavailable`);
+        logHopFailure('cursor', res.reason, performance.now() - hopStart);
         upstreamFailureState = { failure: failureCode(res.reason) };
         const statusMatch = res.reason.match(/^HTTP (\d+)/);
         if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
@@ -339,44 +352,103 @@ export function buildServer({
       }
     };
 
-    /**
-     * Cascade steps after Cursor: Gemini, then cheap; whichever serves holds the fallback loop.
-     * The reason names the tier that failed just before. Returns whether a reply was sent:
-     * never return the relay itself, a FastifyReply is thenable and awaits to undefined.
-     */
-    const serveGeminiOrCheap = async (
-      beforeGemini: RouteReason,
-      sendCheap: () => Promise<ProviderResult>,
-      onServed: () => void = () => {},
-    ): Promise<boolean> => {
-      if (!hasImageDocumentOrToolChoice(base.body!)) {
-        const geminiRes = await tryCliTier('gemini', activeBase);
-        if (geminiRes) {
-          onServed();
-          router.markFallbackLoop(decision, 'gemini');
-          const routeDec: RouteDecision = { ...decision, route: 'gemini', tier: 'gemini', reason: beforeGemini, fallbackLoop: 'gemini' };
-          relay(reply, geminiRes, routeDec, req, exchange('gemini'));
-          return true;
-        }
+    type FlashResult =
+      | { kind: 'response'; result: ProviderResult }
+      | { kind: 'skipped'; reason: 'skipped:gemini-busy' | 'skipped:gemini-unhealthy' }
+      | { kind: 'failed'; reason: 'failover:gemini-unavailable' };
+
+    const tryFlash = async (r: ProviderRequest): Promise<FlashResult> => {
+      const provider = providers.gemini;
+      const breaker = geminiBreaker;
+      if (!provider || !breaker || breaker.state === 'open') {
+        upstreamFailureState = { failure: 'skipped' };
+        return { kind: 'skipped', reason: 'skipped:gemini-unhealthy' };
       }
-      const cheapRes = await sendCheap();
-      if (cheapRes.kind !== 'response') return false;
-      onServed();
-      // Hold the loop, never demote the session: the quota gate hands the next human turn back to Claude.
-      router.markFallbackLoop(decision, 'trivial');
-      // Gemini counts once the tier is wired in (attempted, or skipped by breaker/image guard).
-      const reason: RouteReason = providers.gemini ? 'failover:gemini-unavailable' : beforeGemini;
-      const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason, fallbackLoop: 'trivial' };
-      relay(reply, cheapRes, routeDec, req, exchange('cheap'));
-      return true;
+      if (!breaker.acquire()) {
+        upstreamFailureState = { failure: 'skipped' };
+        return { kind: 'skipped', reason: 'skipped:gemini-busy' };
+      }
+      const hopStart = performance.now();
+      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
+      try {
+        let res: ProviderResult;
+        try {
+          res = await provider.send(r);
+        } catch (err) {
+          const rawReason = err instanceof Error ? err.message : String(err);
+          logHopFailure('flash', rawReason, performance.now() - hopStart);
+          upstreamFailureState = { failure: failureCode(rawReason) };
+          return { kind: 'failed', reason: 'failover:gemini-unavailable' };
+        }
+        if (res.kind === 'response') {
+          outcome = 'success';
+          return { kind: 'response', result: res };
+        }
+        const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
+        const overBudget = res.reason === 'transcript budget exceeded';
+        if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
+        logHopFailure('flash', res.reason, performance.now() - hopStart);
+        upstreamFailureState = { failure: failureCode(res.reason) };
+        const statusMatch = res.reason.match(/^HTTP (\d+)/);
+        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
+        return { kind: 'failed', reason: 'failover:gemini-unavailable' };
+      } finally {
+        breaker.release(outcome);
+      }
     };
 
-    /**
-     * Every Claude send carries the session's primary profile. A 400 on the rewritten body
-     * resends the original; the session drops profiles only when that original succeeds (2xx).
-     */
-    // served is the profile that went out; exchange() snapshots failure state, so build it at relay time.
-    const sendClaude = async (b: ProviderRequest, dec: RouteDecision): Promise<{ result: ProviderResult; dec: RouteDecision; served?: PrimaryProfile }> => {
+    const getArgonModel = (profile: ArgonProfile): string => {
+      if (profile === 'low') return config.argon.modelLow;
+      if (profile === 'high') return config.argon.modelHigh;
+      return config.argon.modelMedium;
+    };
+
+    const tryArgon = async (
+      profile: ArgonProfile,
+      r: ProviderRequest,
+    ): Promise<{ kind: 'response'; result: ProviderResult } | { kind: 'skipped' } | { kind: 'failed'; reason: string }> => {
+      const provider = providers.gemini;
+      const breaker = argonBreaker ?? geminiBreaker;
+      if (!config.argon.enabled || !provider || !breaker || breaker.state === 'open') {
+        return { kind: 'skipped' };
+      }
+      if (!breaker.acquire()) {
+        return { kind: 'skipped' };
+      }
+      const hopStart = performance.now();
+      const model = getArgonModel(profile);
+      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
+      try {
+        let res: ProviderResult;
+        try {
+          res = await provider.send({ ...r, modelOverride: model });
+        } catch (err) {
+          const rawReason = err instanceof Error ? err.message : String(err);
+          logHopFailure('argon', rawReason, performance.now() - hopStart);
+          upstreamFailureState = { failure: failureCode(rawReason) };
+          return { kind: 'failed', reason: rawReason };
+        }
+        if (res.kind === 'response') {
+          outcome = 'success';
+          return { kind: 'response', result: res };
+        }
+        const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
+        const overBudget = res.reason === 'transcript budget exceeded';
+        if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
+        logHopFailure('argon', res.reason, performance.now() - hopStart);
+        upstreamFailureState = { failure: failureCode(res.reason) };
+        const statusMatch = res.reason.match(/^HTTP (\d+)/);
+        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
+        return { kind: 'failed', reason: res.reason };
+      } finally {
+        breaker.release(outcome);
+      }
+    };
+
+    const sendClaude = async (
+      b: ProviderRequest,
+      dec: RouteDecision,
+    ): Promise<{ result: ProviderResult; dec: RouteDecision; served?: PrimaryProfile }> => {
       const profile = dec.primaryProfile;
       const profiled = profile && b.rawBody ? withPrimaryProfile(b.rawBody, profile) : undefined;
       if (!profile || !profiled) return { result: await sendPrimary(b), dec };
@@ -384,219 +456,221 @@ export function buildServer({
       if (first.kind !== 'response' || first.status !== 400) return { result: first, dec, served: profile };
       const error = Buffer.concat(await first.body.toArray()).toString('utf8').slice(0, 500);
       const result = await sendPrimary(b);
-      // Only an accepted original proves the rewrite was the problem; 4xx/429/5xx/network say nothing about it.
       if (result.kind !== 'response' || result.status < 200 || result.status >= 300) return { result, dec };
       req.log.warn({ profile, error }, 'primary profile refused, cleared');
       router.refusePrimaryProfile(dec);
       const refused: RouteDecision = { ...dec, reason: 'profile:refused' };
       return { result, dec: refused };
     };
+
     const relayClaude = async (b: ProviderRequest, dec: RouteDecision) => {
       const c = await sendClaude(b, dec);
-      return relay(reply, c.result, c.dec, req, exchange('primary', c.served?.model, c.served?.effort));
+      return safeRelay(c.result, c.dec, exchange('primary', c.served?.model, c.served?.effort));
     };
 
-    if (decision.route === 'cursor') {
-      const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCliTier('cursor', activeBase);
-      if (cursorRes) return relay(reply, cursorRes, decision, req, exchange('cursor'));
+    const safeRelay = async (
+      result: ProviderResult,
+      dec: RouteDecision,
+      exch?: ExchangeContext,
+    ) => {
+      if (keepAlive) keepAlive.stop();
 
-      // Cascade advance from a fallback-loop continuation: Cursor -> Gemini -> cheap -> primary (one-off, never pinned).
-      if (await serveGeminiOrCheap('failover:cursor-unavailable', () => doSendCheapWithRetry(cheapProvider, cheapReq))) return reply;
+      const servedModel = exch?.model ?? (dec.route === 'primary' ? base.body!.model : config.gemini?.model ?? 'gemini-3.8-flash-high');
+      const servedEffort = exch?.effort;
+      req.log.info(
+        { route: dec.route, tier: dec.tier ?? dec.route, model: servedModel, effort: servedEffort, reason: dec.reason },
+        'routing decision',
+      );
+
+      if (keepAlive && keepAlive.didSendHeaders()) {
+        if (result.kind === 'response') {
+          for await (const chunk of result.body) {
+            reply.raw.write(chunk);
+          }
+          reply.raw.end();
+        } else {
+          reply.raw.write(
+            `event: error\ndata: {"type":"error","error":{"type":"api_error","message":"jev-router: ${result.reason}"}}\n\n`,
+          );
+          reply.raw.end();
+        }
+        return reply;
+      }
+      return relay(reply, result, dec, req, exch);
+    };
+
+    // Execution chain based on routed decision
+    if (decision.route === 'cursor') {
+      const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCursor(activeBase);
+      if (cursorRes) {
+        router.markFallbackLoop(decision, 'cursor');
+        return safeRelay(cursorRes, decision, exchange('cursor'));
+      }
+
+      // Cursor failed -> fall back to Argon (starting profile from selectArgonProfile)
+      let curProfile: ArgonProfile | null = selectArgonProfile(decision.distribution ?? { simple: 0, standard: 1, structural: 0 }) ?? 'low';
+      while (curProfile !== null) {
+        const argonAttempt = await tryArgon(curProfile, activeBase);
+        if (argonAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'argon');
+          const argonModel = getArgonModel(curProfile);
+          const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason: 'escalated:cursor-failed' };
+          return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
+        }
+        if (argonAttempt.kind === 'skipped') {
+          break; // skip without bump to Claude
+        }
+        curProfile = bumpArgonProfile(curProfile);
+      }
+
+      // Argon exhausted or skipped -> Claude
       router.clearFallbackLoop(decision, 'primary');
       const routeDec: RouteDecision = await router.profileForFallback(
-        { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' },
+        { ...decision, route: 'primary', tier: 'primary', reason: 'escalated:argon-failed' },
         context,
         'gemini-failed',
       );
       return relayClaude(base, routeDec);
     }
 
-    if (decision.route === 'gemini') {
-      const fallbackToPrimary = async (reason: RouteReason, escalation: EscalationReason) => {
-        router.clearGeminiLoop(decision, 'primary');
-        const routeDec: RouteDecision = await router.profileForFallback(
-          { ...decision, route: 'primary', reason },
-          context,
-          escalation,
-        );
-        // base, not activeBase: the Gemini handoff in the system prompt would rewrite Claude's cache.
-        return relayClaude(base, routeDec);
-      };
+    if (decision.route === 'free') {
+      const flashRes = hasImageDocumentOrToolChoice(base.body!)
+        ? { kind: 'skipped' as const, reason: 'skipped:gemini-unhealthy' as const }
+        : await tryFlash(activeBase);
+      if (flashRes.kind === 'response') {
+        router.markFallbackLoop(decision, 'free');
+        return safeRelay(flashRes.result, decision, exchange('free', config.gemini?.model));
+      }
 
-      const doFallback = async (reason: RouteReason, escalation: EscalationReason) => {
-        if (decision.fallbackLoop) {
-          // Cascade continuation: Gemini -> cheap -> primary one-off (never pinToPrimary from a cascade continuation).
-          const resCheap = await doSendCheapWithRetry(cheapProvider, cheapReq);
-          if (resCheap.kind === 'response') {
-            router.markFallbackLoop(decision, 'trivial');
-            const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'trivial', reason, fallbackLoop: 'trivial' };
-            return relay(reply, resCheap, routeDec, req, exchange('cheap'));
+      const flashFailureReason = flashRes.reason;
+      let argonFailed = false;
+      if (config.argon.enabled && flashRes.kind !== 'skipped') {
+        let curProfile: ArgonProfile | null = selectArgonProfile(decision.distribution ?? { simple: 1, standard: 0, structural: 0 }) ?? 'low';
+        while (curProfile !== null) {
+          const argonAttempt = await tryArgon(curProfile, activeBase);
+          if (argonAttempt.kind === 'response') {
+            router.markFallbackLoop(decision, 'argon');
+            const argonModel = getArgonModel(curProfile);
+            const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason: 'escalated:flash-failed' };
+            return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
           }
-          router.clearFallbackLoop(decision, 'primary');
-          const routeDec: RouteDecision = await router.profileForFallback(
-            { ...decision, route: 'primary', tier: 'primary', reason: 'failover:cheap-unavailable' },
-            context,
-            'gemini-failed',
-          );
-          return relayClaude(base, routeDec);
+          if (argonAttempt.kind === 'skipped') {
+            break;
+          }
+          argonFailed = true;
+          curProfile = bumpArgonProfile(curProfile);
         }
-
-        if (decision.fallbackTier !== 'trivial' && decision.fallbackTier !== 'standard') {
-          return fallbackToPrimary(reason, escalation);
-        }
-
-        if (cheapHealth?.state === 'down') {
-          return fallbackToPrimary(reason, escalation);
-        }
-
-        router.clearGeminiLoop(decision, decision.fallbackTier);
-        const fbProvider = (decision.fallbackTier === 'standard' && providers.standard) ? providers.standard : providers.cheap;
-        const resFb = await doSendCheapWithRetry(fbProvider, { ...cheapReq, onStreamFailure: () => router.pinToPrimary(decision) });
-        if (resFb.kind === 'response') {
-          const routeDec: RouteDecision = { ...decision, route: 'cheap', reason };
-          return relay(reply, resFb, routeDec, req, exchange('cheap'));
-        }
-
-        router.pinToPrimary(decision);
-        return fallbackToPrimary('failover:cheap-unavailable', 'gemini-failed');
-      };
-
-      if (!providers.gemini || !geminiBreaker || geminiBreaker.state === 'open') {
-        upstreamFailureState = { failure: 'skipped' };
-        return doFallback('skipped:gemini-unhealthy', 'gemini-unhealthy');
       }
 
-      if (!geminiBreaker.acquire()) {
-        upstreamFailureState = { failure: 'skipped' };
-        // Busy is momentary (another session holds the slot): Claude serves this turn only, the session stays on Gemini.
-        if (!decision.fallbackLoop && decision.fallbackTier === 'primary') {
-          const routeDec = await router.profileForFallback(
-            { ...decision, route: 'primary', reason: 'skipped:gemini-busy' },
-            context,
-            'gemini-busy',
-          );
-          return relayClaude(base, routeDec);
-        }
-        return doFallback('skipped:gemini-busy', 'gemini-busy');
+      // Claude fallback
+      if (flashFailureReason !== 'skipped:gemini-busy') {
+        router.clearGeminiLoop(decision, 'primary');
       }
-
-      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
-      try {
-        const res = await providers.gemini.send(activeBase);
-        if (res.kind === 'response') {
-          outcome = 'success';
-          return relay(reply, res, decision, req, exchange('gemini'));
-        }
-
-        const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
-        if (res.reason === 'aborted' || isRoutingMiss) {
-          outcome = 'neutral';
-        }
-
-        req.log.warn({ reason: res.reason, conversation: decision.conversationKey }, 'gemini provider unavailable');
-        upstreamFailureState = { failure: failureCode(res.reason) };
-        const statusMatch = res.reason.match(/^HTTP (\d+)/);
-        if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-        const escalation: EscalationReason =
-          res.reason === 'aborted' || isRoutingMiss ? 'gemini-unhealthy' : 'gemini-failed';
-        return await doFallback('failover:gemini-unavailable', escalation);
-      } finally {
-        geminiBreaker.release(outcome);
-      }
+      const fallbackReason = argonFailed ? 'escalated:argon-failed' : flashFailureReason;
+      const escalationKind: EscalationReason = flashFailureReason === 'skipped:gemini-busy' ? 'gemini-busy' : 'gemini-failed';
+      const routeDec: RouteDecision = await router.profileForFallback(
+        { ...decision, route: 'primary', tier: 'primary', reason: fallbackReason },
+        context,
+        escalationKind,
+      );
+      return relayClaude(base, routeDec);
     }
 
-    // A provider known to be down costs a failed attempt per turn: skip it, and do not
-    // pin the conversation, so it returns to cheap once the provider is back.
-    if (decision.route === 'cheap' && cheapHealth?.state === 'down') {
-      const skipped: RouteDecision = { ...decision, route: 'primary', reason: 'skipped:cheap-unhealthy' };
-      upstreamFailureState = { failure: 'skipped' };
-      return relayClaude(base, skipped);
-    }
-
-    if (decision.route === 'cheap') {
-      const cheap = await doSendCheapWithRetry(cheapProvider, { ...cheapReq, onStreamFailure: () => router.pinToPrimary(decision) });
-      if (cheap.kind === 'response') return relay(reply, cheap, decision, req, exchange('cheap'));
-
-      if (decision.reason === 'read-first:standard' && providers.cheap) {
-        const trivial = await doSendCheapWithRetry(providers.cheap, { ...cheapReq, onStreamFailure: () => router.pinToPrimary(decision) });
-        if (trivial.kind === 'response') {
-          router.useTrivial(decision);
-          req.log.info({ conversation: decision.conversationKey }, 'standard tier unavailable, read-first turn served by trivial tier');
-          const trivialDecision: RouteDecision = { ...decision, tier: 'trivial' as Tier, reason: 'failover:standard-unavailable' };
-          return relay(reply, trivial, trivialDecision, req, exchange('cheap', config.cheap.model));
+    if (decision.route === 'argon') {
+      let curProfile: ArgonProfile | null = decision.argonProfile ?? selectArgonProfile(decision.distribution ?? { simple: 0, standard: 1, structural: 0 }) ?? 'low';
+      let isFirst = true;
+      while (curProfile !== null) {
+        const argonAttempt = await tryArgon(curProfile, activeBase);
+        if (argonAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'argon');
+          const argonModel = getArgonModel(curProfile);
+          const reason: RouteReason = isFirst ? (`argon:${curProfile}` as RouteReason) : 'escalated:argon-failed';
+          const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason };
+          return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
         }
+        if (argonAttempt.kind === 'skipped') {
+          break;
+        }
+        isFirst = false;
+        curProfile = bumpArgonProfile(curProfile);
       }
 
-      router.pinToPrimary(decision);
-      const failover: RouteDecision = { ...decision, route: 'primary', reason: 'failover:cheap-unavailable' };
-      req.log.warn({ reason: cheap.reason, conversation: decision.conversationKey }, 'cheap provider unavailable');
-      return relayClaude(base, failover);
+      router.clearFallbackLoop(decision, 'primary');
+      const routeDec: RouteDecision = await router.profileForFallback(
+        { ...decision, route: 'primary', tier: 'primary', reason: 'escalated:argon-failed' },
+        context,
+        'gemini-failed',
+      );
+      return relayClaude(base, routeDec);
     }
 
+    // Default: primary (Claude)
     const claude = await sendClaude(activeBase, decision);
     const primary = claude.result;
     const primaryDecision = claude.dec;
+
     if (
       primary.kind === 'unavailable' ||
       !config.router.failoverOnPrimaryRateLimit ||
       !PRIMARY_RATE_LIMITED.has(primary.status)
     ) {
-      return relay(reply, primary, primaryDecision, req, exchange('primary', claude.served?.model, claude.served?.effort));
+      return safeRelay(primary, primaryDecision, exchange('primary', claude.served?.model, claude.served?.effort));
     }
 
     if (isQuotaProbe(base.body)) {
       const quotaHeaderNames = rateLimitHeaderNames(primary.headers);
       req.log.info({ status: primary.status, quotaHeaderNames }, 'primary rate-limited probe passed through');
       upstreamFailureState = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
-      return relay(reply, primary, primaryDecision, req, exchange('primary', claude.served?.model, claude.served?.effort));
+      return safeRelay(primary, primaryDecision, exchange('primary', claude.served?.model, claude.served?.effort));
     }
 
     const quotaHeaderNames = rateLimitHeaderNames(primary.headers);
-    req.log.warn({ status: primary.status, quotaHeaderNames, conversation: decision.conversationKey }, 'primary rate-limited, failing over (cascade Cursor -> Gemini -> cheap)');
+    req.log.warn({ status: primary.status, quotaHeaderNames, conversation: decision.conversationKey }, 'primary rate-limited, failing over (cascade Cursor -> Gemini)');
 
-    // Cascade failover: hold the (small) error body so it can still be relayed
-    // verbatim if no cascade tier can take the request either. One-shot: these
-    // attempts never re-enter this tail.
     const errorBody = Buffer.concat(await primary.body.toArray());
     const skipCli = hasImageDocumentOrToolChoice(base.body!);
     const primaryFailure = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
 
-    // A hard risk veto wins over the cascade: a risky turn must not be
-    // served by Cursor/Gemini/cheap just because Claude rate-limited.
-    // Relay the original Anthropic error verbatim (all-tiers-down path).
-    // Unclassified turns (sticky primary, tool continuations) are classified
-    // here, on their last human text, before they can leave Claude.
     const vetoed = decision.distribution ? hardRiskVeto(decision.distribution) : await router.cascadeRiskVeto(base.body!);
     if (vetoed) {
       upstreamFailureState = primaryFailure;
       const original: ProviderResult = { ...primary, body: Readable.from([errorBody]) };
-      return relay(reply, original, decision, req, exchange('primary'));
+      return safeRelay(original, decision, exchange('primary'));
     }
 
     if (!skipCli) {
-      const cursorRes = await tryCliTier('cursor', activeBase);
+      const cursorRes = await tryCursor(activeBase);
       if (cursorRes) {
         router.markFallbackLoop(decision, 'cursor');
         upstreamFailureState = primaryFailure;
-        return relay(
-          reply,
+        return safeRelay(
           cursorRes,
           { ...decision, route: 'cursor', tier: 'cursor', reason: 'failover:primary-rate-limited', fallbackLoop: 'cursor' },
-          req,
           exchange('cursor'),
+        );
+      }
+
+      const flashRes = await tryFlash(activeBase);
+      if (flashRes.kind === 'response') {
+        router.markFallbackLoop(decision, 'free');
+        upstreamFailureState = primaryFailure;
+        return safeRelay(
+          flashRes.result,
+          {
+            ...decision,
+            route: 'free',
+            tier: 'free',
+            reason: providers.cursor ? 'failover:cursor-unavailable' : 'failover:primary-rate-limited',
+            fallbackLoop: 'free',
+          },
+          exchange('free', config.gemini?.model),
         );
       }
     }
 
-    // Without a Cursor tier, Gemini/cheap keep the pre-cascade reason.
-    const served = await serveGeminiOrCheap(
-      providers.cursor ? 'failover:cursor-unavailable' : 'failover:primary-rate-limited',
-      () => providers.cheap.send(cheapReq),
-      () => { upstreamFailureState = primaryFailure; },
-    );
-    if (served) return reply;
+    // All cascade tiers failed: relay original 429/529
     const original: ProviderResult = { ...primary, body: Readable.from([errorBody]) };
-    return relay(reply, original, decision, req, exchange('primary'));
+    return safeRelay(original, decision, exchange('primary'));
   }
 
   function providerRequest(req: FastifyRequest, reply: FastifyReply): ProviderRequest {
@@ -625,17 +699,15 @@ export function buildServer({
   ) {
     const audited = decision && exchange;
     if (result.kind === 'unavailable') {
-      // The 502 body reaches the client only; without this the cause is lost (2026-10-10: 79 bare 502s).
       reply.log.warn({ route: decision?.route, reason: result.reason }, 'upstream unavailable');
       if (audited) auditFailure(telemetry, decision, exchange, result.reason);
       return reply.code(502).send(anthropicError('api_error', `jev-router: ${result.reason}`));
     }
     if (decision) {
-      req?.log.info({ route: decision }, 'route decision');
       reply.header('x-jev-route', `${decision.route}; reason=${decision.reason}`);
       const key = decision.conversationKey;
       if (key?.endsWith(':main')) {
-        lastRoutes.delete(key); // re-insert at the end: the Map's order is then oldest-first
+        lastRoutes.delete(key);
         lastRoutes.set(key, { route: decision.route, reason: decision.reason, at: new Date().toISOString() });
         if (lastRoutes.size > 500) lastRoutes.delete(lastRoutes.keys().next().value!);
       }
@@ -650,8 +722,14 @@ export function buildServer({
   }
 
   app.setErrorHandler((err, req, reply) => {
-    if (reply.raw.destroyed) return; // client went away mid-request
-    // Fastify's own 4xx (body too large, bad content type) are the client's problem, not the upstream's.
+    if (reply.raw.destroyed) return;
+    if (reply.raw.headersSent) {
+      try {
+        reply.raw.write(`event: error\ndata: {"type":"error","error":{"type":"api_error","message":"jev-router: upstream error"}}\n\n`);
+        reply.raw.end();
+      } catch {}
+      return;
+    }
     const status = (err as unknown as { statusCode?: number }).statusCode;
     if (status !== undefined && status >= 400 && status < 500) {
       const message = (err as unknown as { message?: string }).message || 'request error';

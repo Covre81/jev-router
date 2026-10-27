@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { Readable } from 'node:stream';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { request } from 'undici';
 import { loadConfig } from '../src/config.js';
 import { AnthropicProvider } from '../src/providers/anthropic.js';
-import { OpenAICompatibleProvider } from '../src/providers/openai/provider.js';
+import { CircuitBreaker } from '../src/providers/breaker.js';
 import { buildServer } from '../src/proxy/server.js';
 import type { ClassificationInput, ComplexityClassifier } from '../src/classifier/classifier.js';
 import type { ComplexityDistribution } from '../src/domain/complexity.js';
@@ -90,7 +91,7 @@ const STRUCTURAL: ComplexityDistribution = { simple: 0.03, standard: 0.12, struc
 
 function setup(script: () => ComplexityDistribution, primaryProfiles = true, quota?: RouterOptions['quota']) {
   return new Router(new ScriptedClassifier(script), new TtlLruStore<Tier>(100, 60_000), {
-    policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+    policy: { minCheapProbability: 0.8, standardRoute: 'primary', standardEnabled: false, argonEnabled: false },
     primaryClasses: new Set(['auxiliary', 'compaction']),
     cheapContextTokens: 100_000,
     classifierTimeoutMs: 1_000,
@@ -198,7 +199,7 @@ describe('Router primary profile', () => {
   it('picks a profile when a cheap conversation escalates to Claude (no Claude cache to lose)', async () => {
     let next = SIMPLE;
     const router = setup(() => next);
-    assert.equal((await router.decide(ctx([user('lista os arquivos')]))).route, 'cheap');
+    assert.equal((await router.decide(ctx([user('lista os arquivos')]))).route, 'free');
     next = STRUCTURAL;
     const up = await router.decide(ctx([user('lista os arquivos'), assistantText, user('redesenha o roteador')]));
     assert.equal(up.route, 'primary');
@@ -230,9 +231,10 @@ describe('server: primary profile on the wire', () => {
   const scores: object[] = []; // consumed first, one per classifier call
   const rows: NewRouterLog[] = [];
   let anthropic: Server;
-  let cheap: Server;
+  let geminiUp = false;
   let proxy: FastifyInstance;
   let url: string;
+  let geminiBreakerInstance: CircuitBreaker;
 
   before(async () => {
     anthropic = createServer(async (req, res) => {
@@ -243,25 +245,31 @@ describe('server: primary profile on the wire', () => {
       res.writeHead(code, { 'content-type': 'application/json' }).end(code === 200 ? '{"type":"message","content":[]}' : '{"type":"error","error":{"type":"invalid_request_error","message":"no"}}');
     });
     await new Promise<void>((r) => anthropic.listen(0, '127.0.0.1', r));
-    // The reserve tier: down unless a test brings it up, so a Claude 5xx/429 is relayed as is.
-    cheap = createServer(async (req, res) => {
-      for await (const _ of req);
-      if (!cheapUp) return res.writeHead(503).end();
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { content: 'Hi' }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 5 } }));
-    });
-    await new Promise<void>((r) => cheap.listen(0, '127.0.0.1', r));
+
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
       ANTHROPIC_UPSTREAM_URL: `http://127.0.0.1:${(anthropic.address() as AddressInfo).port}`,
-      CHEAP_BASE_URL: `http://127.0.0.1:${(cheap.address() as AddressInfo).port}/v1`,
-      CHEAP_API_KEY: 'k',
+      ARGON_TIER: 'off',
       LOG_LEVEL: 'fatal',
     });
     const router = setup(() => (scores.shift() as ComplexityDistribution | undefined) ?? score, true, { level: () => 'none', current: () => quota });
+    const fakeGemini = {
+      send: async () => {
+        if (!geminiUp) return { kind: 'unavailable', reason: 'down' };
+        return {
+          kind: 'response',
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Readable.from([Buffer.from(JSON.stringify({ type: 'message', content: [] }))]),
+        };
+      },
+    };
+    geminiBreakerInstance = new CircuitBreaker(1, 100_000, 1);
     proxy = buildServer({
       config,
       router,
-      providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      providers: { primary: new AnthropicProvider(config.primary), gemini: fakeGemini as any },
+      geminiBreaker: geminiBreakerInstance,
       telemetry: { record: (r) => void rows.push(r), close: async () => {} },
     });
     await proxy.listen({ host: '127.0.0.1', port: 0 });
@@ -270,18 +278,18 @@ describe('server: primary profile on the wire', () => {
   after(async () => {
     await proxy.close();
     anthropic.close();
-    cheap.close();
   });
   beforeEach(() => {
     sent.length = 0;
     status = 200;
     fails = 1;
     second = 200;
-    cheapUp = false;
+    geminiUp = false;
     quota = undefined;
     score = STANDARD;
     scores.length = 0;
     rows.length = 0;
+    geminiBreakerInstance?.release('success');
   });
 
   const turn = (session: string, messages: unknown[] = [user('refatora esse modulo')], requestClass = 'main') =>
@@ -358,21 +366,21 @@ describe('server: primary profile on the wire', () => {
   it('a Sonnet session that fails over on a 429 comes back to Claude still on Sonnet (cache kept)', async () => {
     fails = 1;
     second = 429; // sends: 1 ok, 2 rate-limited, 3 ok
-    cheapUp = true;
+    geminiUp = true;
     await (await turn('W6')).body.text();
     score = STRUCTURAL; // a re-pick on the way back would show up as Opus
 
     const limited = await turn('W6', [user('refatora esse modulo'), assistantToolUse, toolResult]);
     await limited.body.text();
     assert.equal(limited.statusCode, 200);
-    assert.equal(limited.headers['x-jev-route'], 'cheap; reason=failover:primary-rate-limited');
+    assert.equal(limited.headers['x-jev-route'], 'free; reason=failover:primary-rate-limited');
 
     // While the quota is exhausted the reserve keeps the session.
     const history = [user('refatora esse modulo'), assistantToolUse, toolResult, assistantText];
     quota = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
     const held = await turn('W6', [...history, user('continua')]);
     await held.body.text();
-    assert.equal(held.headers['x-jev-route'], 'cheap; reason=sticky');
+    assert.equal(held.headers['x-jev-route'], 'free; reason=sticky');
 
     // Quota back: Claude again, on the session's Sonnet, not the client's Opus.
     quota = { utilization: 0.4, window: '5h', observedAt: new Date() };
@@ -402,7 +410,7 @@ describe('server: primary profile on the wire', () => {
     await (await turn('W7')).body.text();
     fails = 1;
     second = 429;
-    cheapUp = true;
+    geminiUp = true;
     scores.push(STANDARD, { ...STANDARD, risk: 0.95 }); // profile pick: harmless; veto's own call: risky
     const res = await request(`${url}/v1/messages`, {
       method: 'POST',

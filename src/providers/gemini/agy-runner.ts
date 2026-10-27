@@ -8,8 +8,10 @@ export interface AgyRunnerOptions {
   readonly bin: string;
   readonly model: string;
   readonly timeoutMs: number;
+  readonly firstByteTimeoutMs?: number | undefined;
+  readonly idleTimeoutMs?: number | undefined;
   readonly home: string;
-  readonly signal?: AbortSignal;
+  readonly signal?: AbortSignal | undefined;
 }
 
 export type AgyResult =
@@ -64,8 +66,13 @@ export async function runAgy(
     let toolAttempted: string | false = false;
     let stdoutBuffer = '';
     let textDelta = '';
+    let firstByteReceived = false;
 
     return await new Promise<AgyResult>((resolve) => {
+      let firstByteTimer: NodeJS.Timeout | undefined;
+      let idleTimer: NodeJS.Timeout | undefined;
+      let overallTimer: NodeJS.Timeout | undefined;
+
       const abortHandler = () => {
         if (child.pid !== undefined) killTree(child.pid);
         settle({ ok: false, reason: 'aborted' });
@@ -74,12 +81,22 @@ export async function runAgy(
       const settle = (result: AgyResult) => {
         if (isSettled) return;
         isSettled = true;
-        clearTimeout(timeout);
+        if (firstByteTimer) clearTimeout(firstByteTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        if (overallTimer) clearTimeout(overallTimer);
         opts.signal?.removeEventListener('abort', abortHandler);
         resolve(result);
       };
 
-      const timeout = setTimeout(() => {
+      const firstByteTimeoutMs = opts.firstByteTimeoutMs ?? 60_000;
+      const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
+
+      firstByteTimer = setTimeout(() => {
+        if (child.pid !== undefined) killTree(child.pid);
+        settle({ ok: false, reason: 'first-byte-timeout' });
+      }, firstByteTimeoutMs);
+
+      overallTimer = setTimeout(() => {
         if (child.pid !== undefined) killTree(child.pid);
         settle({ ok: false, reason: 'timeout' });
       }, opts.timeoutMs);
@@ -98,6 +115,19 @@ export async function runAgy(
       }
 
       child.stdout!.on('data', (chunk) => {
+        if (!firstByteReceived) {
+          firstByteReceived = true;
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+            firstByteTimer = undefined;
+          }
+        }
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (child.pid !== undefined) killTree(child.pid);
+          settle({ ok: false, reason: 'idle-timeout' });
+        }, idleTimeoutMs);
+
         stdoutBuffer += chunk.toString('utf8');
         const lines = stdoutBuffer.split('\n');
         stdoutBuffer = lines.pop() || '';
@@ -147,7 +177,6 @@ export async function runAgy(
           }
           return settle({ ok: false, reason: `exit ${code}` });
         }
-        
         if (!finalResult) {
           return settle({ ok: false, reason: 'no result event' });
         }
@@ -157,7 +186,7 @@ export async function runAgy(
         
         const responseText = (finalResult.response || textDelta).trim();
         if (!responseText) {
-          return settle({ ok: false, reason: 'empty response' });
+          return settle({ ok: false, reason: 'empty' });
         }
         
         settle({

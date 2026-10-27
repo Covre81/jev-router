@@ -6,9 +6,6 @@ import { JevClassifier } from './classifier/jev-classifier.js';
 import { removedEnvSet, type Config } from './config.js';
 import type { Tier } from './domain/policy.js';
 import { AnthropicProvider } from './providers/anthropic.js';
-import { CheapHealth } from './providers/cheap-health.js';
-import { OpenAICompatibleProvider } from './providers/openai/provider.js';
-import type { Provider } from './providers/provider.js';
 import { QuotaStore } from './quota.js';
 import { buildServer } from './proxy/server.js';
 import { Router } from './routing/router.js';
@@ -23,21 +20,8 @@ import { GeminiCliProvider } from './providers/gemini/provider.js';
 import { CursorCliProvider } from './providers/cursor/provider.js';
 import { CircuitBreaker } from './providers/breaker.js';
 
-// ponytail: fixed cap, one entry per live conversation. An evicted cheap
-// conversation is treated as unknown and goes primary: savings lost, never
-// correctness. Raise it only if `stats` shows that under heavy parallel use.
 const SESSION_MAX_ENTRIES = 10_000;
 
-const cheapRouteOff: Provider = { name: 'cheap-off', send: async () => ({ kind: 'unavailable', reason: 'cheap route off' }) };
-
-/** Input tokens a cheap model can take: 90% of its window minus the reserved output. */
-const inputBudget = (contextTokens: number, maxOutputTokens: number) => Math.floor(contextTokens * 0.9) - maxOutputTokens;
-
-/**
- * Composition root: the only place that knows concrete implementations.
- * As a supervisor's worker it listens on an ephemeral loopback port and
- * reports it over IPC; otherwise it owns HOST:PORT itself.
- */
 export async function serve(config: Config, { worker = false } = {}): Promise<void> {
   let geminiConfig = config.gemini;
   if (geminiConfig) {
@@ -59,13 +43,10 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
         })
       : new HeuristicClassifier();
 
-  // Errors surface through the server's logger, which exists only after buildServer.
   let logTelemetryError: (err: unknown) => void = () => {};
-  let logCheapState: (state: string) => void = () => {};
   const db = config.telemetry.dbPath ? openTelemetryDb(config.telemetry.dbPath) : undefined;
   const telemetry: TelemetrySink = db ? new SqliteTelemetry(db, { onError: (err) => logTelemetryError(err) }) : noopTelemetry;
 
-  // Persisted on change only: the status line, another process, reads the latest row.
   const quota = config.quota.enabled
     ? new QuotaStore(config.quota, (snapshot) => {
         if (!db) return;
@@ -83,17 +64,12 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
     {
       policy: {
         minCheapProbability: config.router.minCheapProbability,
-        standardRoute: config.router.standardRoute,
-        // Cheap route off: standard work is still proposed, for Gemini to take.
-        standardEnabled: config.cheapStandard !== undefined || !config.cheapRoute,
         minStandardProbability: config.router.minStandardProbability,
+        argonEnabled: config.argon.enabled,
+        // Argon owns the middle band; otherwise simple+standard mass sends medium/coding prompts to Flash.
+        standardEnabled: !config.argon.enabled,
       },
       primaryClasses: config.router.primaryClasses,
-      // Input budget: 90% of the window, minus the output tokens we reserve.
-      cheapContextTokens: inputBudget(config.cheap.contextTokens, config.cheap.maxOutputTokens),
-      ...(config.cheapStandard
-        ? { standardContextTokens: inputBudget(config.cheapStandard.contextTokens, config.cheap.maxOutputTokens) }
-        : {}),
       classifierTimeoutMs: config.classifier.timeoutMs,
       classifierMaxChars: config.classifier.maxChars,
       sessionTtlMs: config.router.sessionTtlMs,
@@ -101,7 +77,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
         ? {
             quota,
             pressurePolicy: {
-              minCheapProbability: config.quota.minCheapProbability,
+              minCheapProbability: config.router.minCheapProbability,
               minStandardProbability: config.quota.minStandardProbability,
             },
           }
@@ -112,18 +88,24 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
               enabled: true,
               minTextOnly: geminiConfig.minTextOnly,
               pressureMinTextOnly: geminiConfig.pressureMinTextOnly,
-              replacesCheap: !config.cheapRoute,
+              replacesCheap: true,
             },
             geminiFromPrimary: geminiConfig.fromPrimary,
           }
         : {}),
-      readFirstStandard: config.cheapRoute && config.cheapReadFirstHint && config.readFirstStandard && config.cheapStandard !== undefined,
       primaryProfiles: config.primaryProfiles,
-      cheapRoute: config.cheapRoute,
+      argonPolicy: config.argon,
+      cursorCoding: config.cursorCoding,
+      cursorCodingMaxTextOnly: config.cursorCodingMaxTextOnly,
+      cursorCodingMinMass: config.cursorCodingMinMass,
+      cursorEnabled: config.cursor !== undefined,
     },
   );
 
   const geminiBreaker = geminiConfig
+    ? new CircuitBreaker(geminiConfig.breakerFailures, geminiConfig.breakerCooldownMs, geminiConfig.maxConcurrency)
+    : undefined;
+  const argonBreaker = geminiConfig
     ? new CircuitBreaker(geminiConfig.breakerFailures, geminiConfig.breakerCooldownMs, geminiConfig.maxConcurrency)
     : undefined;
   const cursorBreaker = config.cursor
@@ -132,28 +114,28 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
 
   const providers = {
     primary: new AnthropicProvider(config.primary),
-    // Cheap route off: the router never picks it; cascade steps that try it fall through to the next tier.
-    cheap: config.cheapRoute ? new OpenAICompatibleProvider(config.cheap) : cheapRouteOff,
-    // Same endpoint and key, bigger model: the health check covers both tiers.
-    ...(config.cheapRoute && config.cheapStandard
-      ? { standard: new OpenAICompatibleProvider({ ...config.cheap, model: config.cheapStandard.model }) }
-      : {}),
     ...(geminiConfig
-      ? { gemini: new GeminiCliProvider(geminiConfig) }
+      ? {
+          gemini: new GeminiCliProvider({
+            ...geminiConfig,
+            firstByteTimeoutMs: config.timeouts.firstByteMs,
+            idleTimeoutMs: config.timeouts.idleMs,
+            argonModels: [config.argon.modelLow, config.argon.modelMedium, config.argon.modelHigh],
+            argonFirstByteTimeoutMs: config.argon.firstByteMs,
+            argonIdleTimeoutMs: config.argon.idleMs,
+          }),
+        }
       : {}),
     ...(config.cursor
-      ? { cursor: new CursorCliProvider(config.cursor) }
+      ? {
+          cursor: new CursorCliProvider({
+            ...config.cursor,
+            firstByteTimeoutMs: config.timeouts.firstByteMs,
+            idleTimeoutMs: config.timeouts.idleMs,
+          }),
+        }
       : {}),
   };
-
-  const cheapHealth = config.cheapRoute && config.cheapHealth.enabled
-    ? new CheapHealth({
-        baseUrl: config.cheap.baseUrl,
-        apiKey: config.cheap.apiKey,
-        intervalMs: config.cheapHealth.intervalMs,
-        onChange: (state) => logCheapState(state),
-      })
-    : undefined;
 
   const build = runningBuild();
   const app = buildServer({
@@ -161,26 +143,22 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
     router,
     providers,
     telemetry,
-    ...(cheapHealth ? { cheapHealth } : {}),
     ...(build ? { build } : {}),
     ...(quota ? { quota } : {}),
     ...(geminiBreaker ? { geminiBreaker } : {}),
+    ...(argonBreaker ? { argonBreaker } : {}),
     ...(cursorBreaker ? { cursorBreaker } : {}),
+    timeouts: config.timeouts,
   });
   logTelemetryError = (err) => app.log.error({ err }, 'telemetry write failed');
-  logCheapState = (state) => app.log[state === 'down' ? 'warn' : 'info']({ cheap: state }, 'cheap provider health changed');
   app.addHook('onClose', () => telemetry.close());
-  app.addHook('onClose', () => cheapHealth?.stop());
 
-  await cheapHealth?.start();
   await app.listen(worker ? { host: '127.0.0.1', port: 0 } : { host: config.host, port: config.port });
   if (worker) {
     process.send?.({ type: 'listening', port: (app.server.address() as AddressInfo).port });
     process.on('message', (msg: { type?: string } | null) => {
-      // Retired by a reload: stop taking connections; the supervisor cuts leftovers after RELOAD_DRAIN_MS.
       if (msg?.type === 'drain') void app.close().then(() => process.exit(0));
     });
-    // Supervisor gone (crash, killed task): never linger as an orphan.
     process.once('disconnect', () => void app.close().then(() => process.exit(0)));
   }
   app.log.info(
@@ -189,9 +167,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       build: build?.sha ?? 'src',
       ...(worker ? { worker: true } : {}),
       primary: config.primary.baseUrl,
-      cheap: `${config.cheap.baseUrl} (${config.cheap.model})`,
-      standard: config.cheapStandard?.model ?? 'off',
-      gemini: geminiConfig ? geminiConfig.model : 'off',
+      argon: config.argon.enabled ? config.argon.modelMedium : 'off',
       cursor: config.cursor ? config.cursor.model : 'off',
       telemetry: config.telemetry.dbPath ?? 'disabled',
     },
@@ -207,7 +183,6 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
   }
 }
 
-/** Supervisor mode: owns HOST:PORT and the control port, forwards to a forked worker. */
 export async function supervise(config: Config, forkWorker: () => WorkerProcess): Promise<void> {
   const supervisor = await startSupervisor({
     host: config.host,

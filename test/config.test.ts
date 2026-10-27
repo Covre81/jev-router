@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { loadConfig, removedEnvSet } from '../src/config.js';
 
-const base = { CLASSIFIER: 'heuristic', CHEAP_API_KEY: 'x' };
+const base = { CLASSIFIER: 'heuristic' };
 
 describe('loadConfig security guards', () => {
   it('requires ANTHROPIC_API_KEY in inject mode', () => {
@@ -35,17 +35,12 @@ describe('supervisor settings', () => {
     assert.throws(() => loadConfig({ ...base, PORT: '65535' }), /CONTROL_PORT/);
     assert.equal(loadConfig({ ...base, PORT: '65535', CONTROL_PORT: '7000' }).supervisor.controlPort, 7000);
   });
-
-  it('reads the cheap health check switches', () => {
-    assert.deepEqual(loadConfig(base).cheapHealth, { enabled: true, intervalMs: 30_000 });
-    assert.equal(loadConfig({ ...base, CHEAP_HEALTH_ENABLED: 'false' }).cheapHealth.enabled, false);
-  });
 });
 
 describe('quota routing settings', () => {
   it('is on by default, with the 429/529 failover', () => {
     const config = loadConfig(base);
-    assert.deepEqual(config.quota, { enabled: true, pressure: 0.8, critical: 0.95, minCheapProbability: 0.7, minStandardProbability: 0.6 });
+    assert.deepEqual(config.quota, { enabled: true, pressure: 0.8, critical: 0.95, minStandardProbability: 0.6 });
     assert.equal(config.router.failoverOnPrimaryRateLimit, true);
     assert.equal(loadConfig({ ...base, QUOTA_ROUTING: 'false' }).quota.enabled, false);
   });
@@ -62,16 +57,52 @@ describe('removedEnvSet', () => {
   });
 });
 
-describe('CHEAP_ROUTE', () => {
-  it('is off by default and then needs no CHEAP_API_KEY', () => {
-    assert.equal(loadConfig(base).cheapRoute, false);
-    const { CHEAP_API_KEY: _, ...noKey } = base as Record<string, string>;
-    assert.equal(loadConfig(noKey).cheapRoute, false);
+describe('Ollama / cheap keys ignored if present', () => {
+  it('ignores all legacy cheap env vars without error', () => {
+    const legacy = {
+      ...base,
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_ROUTE: 'on',
+      CHEAP_API_KEY: 'ollama',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+      CHEAP_MAX_OUTPUT_TOKENS: '8192',
+      CHEAP_CONTEXT_TOKENS: '131072',
+      CHEAP_TIMEOUT_MS: '60000',
+      CHEAP_MODEL_STANDARD: 'gemma4:31b-cloud',
+      CHEAP_HEALTH_ENABLED: 'true',
+      ROUTER_STANDARD_ROUTE: 'cheap',
+      QUOTA_PRESSURE_MIN_CHEAP: '0.7',
+      CHEAP_RETRY: 'true',
+      CHEAP_READ_FIRST_HINT: 'true',
+    };
+    const config = loadConfig(legacy);
+    assert.ok(config);
+    assert.equal((config as any).cheap, undefined);
+    assert.equal((config as any).cheapRoute, undefined);
   });
+});
 
-  it('requires CHEAP_API_KEY when on', () => {
-    const { CHEAP_API_KEY: _, ...noKey } = base as Record<string, string>;
-    assert.throws(() => loadConfig({ ...noKey, CHEAP_ROUTE: 'on' }), /CHEAP_API_KEY/);
-    assert.equal(loadConfig({ ...base, CHEAP_ROUTE: 'on' }).cheapRoute, true);
+describe('New defaults', () => {
+  it('provides expected defaults for Argon, Cursor, timeouts, and Gemini', () => {
+    const config = loadConfig(base);
+    assert.equal(config.argon.enabled, true);
+    assert.equal(config.argon.modelLow, 'gemini-4-argon-low');
+    assert.equal(config.argon.modelMedium, 'gemini-4-argon-medium');
+    assert.equal(config.argon.modelHigh, 'gemini-4-argon-high');
+
+    assert.equal(config.cursorCoding, true);
+    assert.equal(config.cursorCodingMaxTextOnly, 0.75);
+    assert.equal(config.cursorCodingMinMass, 0.5);
+
+    assert.equal(config.timeouts.firstByteMs, 60_000);
+    assert.equal(config.timeouts.idleMs, 60_000);
+    assert.equal(config.timeouts.keepaliveIntervalMs, 15_000);
+
+    const cursorOn = loadConfig({ ...base, CURSOR_TIER: 'on' });
+    assert.equal(cursorOn.cursor?.maxPromptChars, 200_000);
+
+    const geminiOn = loadConfig({ ...base, GEMINI_TIER: 'on' });
+    assert.equal(geminiOn.gemini?.timeoutMs, 300_000);
+    assert.equal(geminiOn.gemini?.model, 'gemini-3.8-flash-high');
   });
 });

@@ -18,7 +18,7 @@ describe('cursor config', () => {
     assert.ok(c.cursor);
     assert.equal(c.cursor.model, 'auto');
     assert.equal(c.cursor.timeoutMs, 180_000);
-    assert.equal(c.cursor.maxPromptChars, 24_000);
+    assert.equal(c.cursor.maxPromptChars, 200_000);
     assert.equal(c.cursor.maxConcurrency, 1);
     assert.equal(c.cursor.breakerFailures, 3);
     assert.equal(c.cursor.breakerCooldownMs, 300_000);
@@ -31,7 +31,7 @@ describe('router fallback-loop stickiness', () => {
     const classifier = { name: 'test', calls: 0, classify: async () => { classifier.calls++; return classification; } };
     const store = new TtlLruStore<any>(100, 60_000);
     const router = new Router(classifier as any, store, {
-      policy: { minCheapProbability: 0.8, standardRoute: 'primary', standardEnabled: false },
+      policy: { minCheapProbability: 0.8, standardRoute: 'primary', standardEnabled: false, argonEnabled: false },
       primaryClasses: new Set(['auxiliary']),
       cheapContextTokens: 100_000,
       classifierMaxChars: 4000,
@@ -146,49 +146,47 @@ describe('router fallback-loop stickiness', () => {
 
   it('tool-result continuation sticks to the marked tier without classification', async () => {
     const { router } = setup(() => undefined);
-    (router as any).markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'gemini');
+    (router as any).markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'free');
     const dec = await router.decide(req(toolTurn));
-    assert.equal(dec.route, 'gemini');
+    assert.equal(dec.route, 'free');
     assert.equal(dec.reason, 'sticky');
   });
 
-  it('cascade cheap failover: tool continuation routes to cheap (trivial) without demoting primary session', async () => {
+  it('cascade failover: tool continuation routes to free without demoting primary session', async () => {
     const snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
     const { router, store } = setup(() => snap);
     store.set('s1:main', 'primary');
-    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'free');
     assert.equal(store.get('s1:main'), 'primary');
     const dec = await router.decide(req(toolTurn));
-    assert.equal(dec.route, 'cheap');
-    assert.equal(dec.tier, 'trivial');
-    assert.equal(dec.fallbackLoop, 'trivial');
+    assert.equal(dec.route, 'free');
+    assert.equal(dec.tier, 'free');
+    assert.equal(dec.fallbackLoop, 'free');
     assert.equal(store.get('s1:main'), 'primary');
   });
 
-  it('cascade cheap failover: non-exhausted quota releases next human turn to primary and clears loop', async () => {
+  it('cascade failover: non-exhausted quota releases next human turn to primary and clears loop', async () => {
     const snap: any = { utilization: 0.2, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
     const { router, store } = setup(() => snap);
     store.set('s1:main', 'primary');
-    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'free');
     const dec = await router.decide(req(humanTurn));
     assert.equal(dec.route, 'primary');
     assert.equal(dec.tier, 'primary');
     assert.equal(store.get('s1:main'), 'primary');
-    // loop cleared: a tool continuation no longer sticks to cheap
     const cont = await router.decide(req(toolTurn));
-    assert.notEqual(cont.route, 'cheap');
-    assert.notEqual(cont.tier, 'trivial');
+    assert.notEqual(cont.route, 'free');
   });
 
-  it('cascade cheap failover: exhausted quota keeps next human turn on cheap', async () => {
+  it('cascade failover: exhausted quota keeps next human turn on loop tier', async () => {
     const snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
     const { router, store } = setup(() => snap);
     store.set('s1:main', 'primary');
-    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'trivial');
+    router.markFallbackLoop({ route: 'primary', reason: 'classified', conversationKey: 's1:main' }, 'free');
     const dec = await router.decide(req(humanTurn));
-    assert.equal(dec.route, 'cheap');
-    assert.equal(dec.tier, 'trivial');
-    assert.equal(dec.fallbackLoop, 'trivial');
+    assert.equal(dec.route, 'free');
+    assert.equal(dec.tier, 'free');
+    assert.equal(dec.fallbackLoop, 'free');
     assert.equal(store.get('s1:main'), 'primary');
   });
 });
@@ -267,7 +265,8 @@ describe('cursor runner/provider units', () => {
       assert.ok(seen.args.includes('--trust'));
       assert.ok(seen.args.includes('--output-format') && seen.args[seen.args.indexOf('--output-format') + 1] === 'stream-json');
       assert.ok(seen.args.includes('--model') && seen.args[seen.args.indexOf('--model') + 1] === 'auto');
-      assert.equal(seen.args.at(-1), 'the prompt');
+      assert.ok(seen.args.includes('--workspace'));
+      assert.equal(seen.args.at(-1), 'Read the file prompt.md in the workspace and follow it exactly. Output only your answer.');
       assert.ok(!('CURSOR_API_KEY' in seen.opts.env));
       assert.ok(!('ANTHROPIC_API_KEY' in seen.opts.env));
       assert.ok(!('TYPESAFE_API_KEY' in seen.opts.env));

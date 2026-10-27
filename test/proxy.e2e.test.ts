@@ -9,7 +9,6 @@ import { HeuristicClassifier } from '../src/classifier/heuristic-classifier.js';
 import { loadConfig } from '../src/config.js';
 import type { Tier } from '../src/domain/policy.js';
 import { AnthropicProvider } from '../src/providers/anthropic.js';
-import { OpenAICompatibleProvider } from '../src/providers/openai/provider.js';
 import { buildServer } from '../src/proxy/server.js';
 import { Router } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
@@ -56,68 +55,28 @@ const anthropic429: Handler = (_seen, res) => {
   res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'quota' } }));
 };
 
-const openAiStream: Handler = async (_seen, res) => {
-  res.writeHead(200, { 'content-type': 'text/event-stream' });
-  res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
-  await sleep(200);
-  res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
-  res.write('data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":5}}\n\n');
-  res.end('data: [DONE]\n\n');
-};
-
-/** What Ollama sends when it fails mid-generation: content, then EOF with no finish_reason and no [DONE]. */
-const openAiCutMidStream: Handler = (_seen, res) => {
-  res.writeHead(200, { 'content-type': 'text/event-stream' });
-  res.end('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
-};
-
-
-/** Non-streaming chat completion: what the cheap provider returns when Claude Code retries without a stream. */
-const openAiJson: Handler = (_seen, res) => {
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ choices: [{ message: { content: 'Hi' }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: 5 } }));
-};
-
-/** A tool-result continuation: not a fresh conversation, so the router reuses the sticky route. */
-const toolLoop = (text: string) => [
-  { role: 'user', content: [{ type: 'text', text }] },
-  { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/r/README.md' } }] },
-  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'Teh readme' }] },
-];
-
-const openAi503: Handler = (_seen, res) => {
-  res.writeHead(503, { 'content-type': 'application/json' }).end('{"error":{"message":"over capacity"}}');
-};
-
-describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)', () => {
+describe('proxy end-to-end (fake Anthropic upstream)', () => {
   let anthropic: { server: Server; url: string };
-  let cheap: { server: Server; url: string };
   let proxy: FastifyInstance;
   let proxyUrl: string;
   let anthropicLog: Seen[] = [];
-  let cheapLog: Seen[] = [];
   let anthropicHandler: Handler = anthropicOk;
-  let cheapHandler: Handler = openAiStream;
   let db: TelemetryDb;
   let telemetry: SqliteTelemetry;
 
   before(async () => {
     anthropic = await fakeServer(() => anthropicHandler, anthropicLog);
-    cheap = await fakeServer(() => cheapHandler, cheapLog);
 
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
-      ROUTER_MIN_CHEAP_PROBABILITY: '0.8', // the heuristic tops out at 0.825
       ANTHROPIC_UPSTREAM_URL: anthropic.url,
-      CHEAP_BASE_URL: `${cheap.url}/openai/v1`,
-      CHEAP_API_KEY: 'gsk_test',
       FAILOVER_ON_PRIMARY_RATE_LIMIT: 'true',
+      ARGON_TIER: 'off',
       LOG_LEVEL: 'fatal',
     });
     const router = new Router(new HeuristicClassifier(), new TtlLruStore<Tier>(100, 60_000), {
-      policy: { minCheapProbability: config.router.minCheapProbability, standardRoute: config.router.standardRoute },
+      policy: { minCheapProbability: config.router.minCheapProbability, argonEnabled: false },
       primaryClasses: config.router.primaryClasses,
-      cheapContextTokens: 100_000,
       classifierTimeoutMs: 1_000,
       classifierMaxChars: 4_000,
     });
@@ -126,7 +85,7 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
     proxy = buildServer({
       config,
       router,
-      providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      providers: { primary: new AnthropicProvider(config.primary) },
       telemetry,
     });
     await proxy.listen({ host: '127.0.0.1', port: 0 });
@@ -137,14 +96,11 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
     await proxy.close();
     await telemetry.close();
     anthropic.server.close();
-    cheap.server.close();
   });
 
   beforeEach(() => {
     anthropicLog.length = 0;
-    cheapLog.length = 0;
     anthropicHandler = anthropicOk;
-    cheapHandler = openAiStream;
   });
 
   const claudeCode = (sessionId: string, turn: string | object[], { stream = true } = {}) =>
@@ -167,95 +123,18 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
       }),
     });
 
-  it('serves a simple task from the cheap provider, translated to Anthropic SSE, streamed live', async () => {
-    const res = await claudeCode('S-simple', 'fix the typo in the README');
-    let firstChunkAt = 0;
-    let text = '';
-    for await (const chunk of res.body) {
-      firstChunkAt ||= Date.now();
-      text += chunk.toString();
-    }
-    const endedAt = Date.now();
-
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.headers['x-jev-route'], 'cheap; reason=classified');
-    assert.ok(endedAt - firstChunkAt >= 100, 'first event must be relayed before the cheap stream ends');
-    assert.match(text, /event: message_start/);
-    assert.match(text, /"text_delta","text":"Hi"/);
-    assert.match(text, /"stop_reason":"end_turn"/);
-    assert.match(text, /event: message_stop/);
-
-    assert.equal(anthropicLog.length, 0, 'the primary quota is untouched');
-    assert.equal(cheapLog[0]?.url, '/openai/v1/chat/completions');
-    assert.equal(cheapLog[0]?.headers.authorization, 'Bearer gsk_test');
-    assert.equal(cheapLog[0]?.headers['x-api-key'], undefined, 'Anthropic credentials never leak to the cheap provider');
-    assert.equal(cheapLog[0]?.body.model, 'gpt-oss:20b-cloud');
-  });
-
   it('sends structural work to Anthropic byte-for-byte', async () => {
     const res = await claudeCode('S-structural', 'refactor the data layer to clean architecture');
     await res.body.text();
     assert.equal(res.headers['x-jev-route'], 'primary; reason=classified');
     assert.equal(res.headers['anthropic-ratelimit-unified-status'], 'allowed');
-    assert.equal(cheapLog.length, 0);
     assert.equal(anthropicLog[0]?.body.model, 'claude-opus-5-5');
     assert.equal(anthropicLog[0]?.headers['anthropic-beta'], 'some-future-beta');
     assert.equal(anthropicLog[0]?.headers['x-api-key'], 'sk-ant-client');
   });
 
-  it('fails over to Anthropic when the cheap provider is down, and pins the conversation', async () => {
-    cheapHandler = openAi503;
-    const res = await claudeCode('S-down', 'fix the typo');
-    await res.body.text();
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.headers['x-jev-route'], 'primary; reason=failover:cheap-unavailable');
-
-    const next = await claudeCode('S-down', toolLoop('fix the typo'));
-    await next.body.text();
-    assert.equal(next.headers['x-jev-route'], 'primary; reason=sticky');
-    assert.equal(cheapLog.length, 2, 'one attempt plus one retry');
-    assert.equal(anthropicLog.length, 2);
-  });
-
-  it("ends a stream cut mid-way with an error event and sends Claude Code's retry to Anthropic", async () => {
-    await (await claudeCode('S-cut', 'fix the typo')).body.text();
-
-    cheapHandler = openAiCutMidStream;
-    const broken = await claudeCode('S-cut', toolLoop('fix the typo'));
-    const text = await broken.body.text();
-    assert.equal(broken.headers['x-jev-route'], 'cheap; reason=sticky');
-    assert.match(text, /event: error\ndata: \{"type":"error","error":\{"type":"api_error"/);
-
-    // Claude Code 2.1.289 re-sends the same turn as a non-streaming request.
-    const retry = await claudeCode('S-cut', toolLoop('fix the typo'), { stream: false });
-    await retry.body.text();
-    assert.equal(retry.headers['x-jev-route'], 'primary; reason=sticky');
-    assert.equal(cheapLog.length, 2, 'the cheap provider is not tried again');
-    assert.equal(anthropicLog.length, 1);
-  });
-
-  it('re-classifies the retry of a first turn cut mid-stream (ADR rule 4: the pin does not hold)', async () => {
-    cheapHandler = openAiCutMidStream;
-    await (await claudeCode('S-cut-first', 'fix the typo')).body.text();
-
-    cheapHandler = openAiJson;
-    const retry = await claudeCode('S-cut-first', 'fix the typo', { stream: false });
-    await retry.body.text();
-    assert.equal(retry.headers['x-jev-route'], 'cheap; reason=classified');
-  });
-
-  it('fails over to the cheap provider when the primary quota is exhausted (opt-in)', async () => {
+  it('relays the primary 429 verbatim when no other provider is available', async () => {
     anthropicHandler = anthropic429;
-    const res = await claudeCode('S-quota', 'refactor the data layer to clean architecture');
-    const text = await res.body.text();
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.headers['x-jev-route'], 'cheap; reason=failover:primary-rate-limited');
-    assert.match(text, /"text":"Hi"/);
-  });
-
-  it('relays the primary 429 verbatim when the cheap provider cannot help either', async () => {
-    anthropicHandler = anthropic429;
-    cheapHandler = openAi503;
     const res = await claudeCode('S-both-down', 'refactor everything');
     const body = await res.body.json();
     assert.equal(res.statusCode, 429);
@@ -302,24 +181,7 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
   }
 
   it('records one telemetry row per exchange, with provider, tokens and JEV verdict', async () => {
-    await (await claudeCode('T-cheap', 'fix the typo in the README')).body.text();
     await (await claudeCode('T-primary', 'refactor the data layer to clean architecture')).body.text();
-
-    const [cheapRow] = await logsFor('T-cheap');
-    assert.ok(cheapRow);
-    assert.equal(cheapRow.finalProvider, 'openai');
-    assert.equal(cheapRow.model, 'gpt-oss:20b-cloud');
-    assert.equal(cheapRow.requestedModel, 'claude-opus-5-5', 'the baseline prices what Anthropic would have run');
-    assert.equal(cheapRow.outcome, 'ok');
-    assert.equal(cheapRow.tokensIn, 40);
-    assert.equal(cheapRow.tokensOut, 5);
-    assert.equal(cheapRow.fallbackTriggered, false);
-    assert.match(cheapRow.humanPromptHash ?? '', /^[0-9a-f]{64}$/);
-    assert.ok(cheapRow.jevDecision && cheapRow.jevDecision.pSimple >= 0.8);
-    assert.ok(cheapRow.latencyMs >= 150, 'latency covers the whole stream');
-    assert.equal(cheapRow.toolsOffered, 0);
-    assert.equal(cheapRow.toolCalls, 0);
-    assert.equal(cheapRow.inspectionMiss, false, 'no tools offered: answering in text is not a miss');
 
     const [primaryRow] = await logsFor('T-primary');
     assert.ok(primaryRow);
@@ -330,22 +192,11 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
     assert.equal(primaryRow.cacheWriteTokens, 0);
     assert.equal(primaryRow.tokensOut, 25);
     assert.equal(primaryRow.httpStatus, 200);
-    assert.equal(primaryRow.inspectionMiss, null, 'only cheap answers are judged');
-  });
-
-  it('flags the fallback when the cheap provider fails and Anthropic answers', async () => {
-    cheapHandler = openAi503;
-    await (await claudeCode('T-fallback', 'fix the typo')).body.text();
-    const [row] = await logsFor('T-fallback');
-    assert.ok(row);
-    assert.equal(row.finalProvider, 'anthropic');
-    assert.equal(row.routeReason, 'failover:cheap-unavailable');
-    assert.equal(row.fallbackTriggered, true);
+    assert.equal(primaryRow.inspectionMiss, null);
   });
 
   it('records relayed upstream errors as http_error', async () => {
     anthropicHandler = anthropic429;
-    cheapHandler = openAi503;
     await (await claudeCode('T-429', 'refactor everything')).body.text();
     const [row] = await logsFor('T-429');
     assert.ok(row);
@@ -399,7 +250,6 @@ describe('proxy end-to-end (fake Anthropic + fake OpenAI-compatible upstreams)',
       anthropicLog.map((s) => s.url),
       ['/v1/messages/count_tokens', '/api/hello'],
     );
-    assert.equal(cheapLog.length, 0);
   });
 });
 
@@ -414,25 +264,22 @@ describe('inject mode: the proxy holds the Anthropic key and gates clients with 
     anthropic = await fakeServer(() => anthropicOk, anthropicLog);
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
-      ROUTER_MIN_CHEAP_PROBABILITY: '0.8', // the heuristic tops out at 0.825
       ANTHROPIC_UPSTREAM_URL: anthropic.url,
       UPSTREAM_AUTH_MODE: 'inject',
       ANTHROPIC_API_KEY: 'sk-ant-proxy-test',
       PROXY_AUTH_TOKEN: PROXY_TOKEN,
-      CHEAP_API_KEY: 'unused',
       LOG_LEVEL: 'fatal',
     });
     const router = new Router(new HeuristicClassifier(), new TtlLruStore<Tier>(100, 60_000), {
-      policy: { minCheapProbability: config.router.minCheapProbability, standardRoute: config.router.standardRoute },
+      policy: { minCheapProbability: config.router.minCheapProbability },
       primaryClasses: config.router.primaryClasses,
-      cheapContextTokens: 100_000,
       classifierTimeoutMs: 1_000,
       classifierMaxChars: 4_000,
     });
     proxy = buildServer({
       config,
       router,
-      providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      providers: { primary: new AnthropicProvider(config.primary) },
     });
     await proxy.listen({ host: '127.0.0.1', port: 0 });
     proxyUrl = `http://127.0.0.1:${(proxy.server.address() as AddressInfo).port}`;
@@ -495,7 +342,6 @@ describe('inject mode: the proxy holds the Anthropic key and gates clients with 
     assert.equal(res.statusCode, 200);
     const body = (await res.body.json()) as Record<string, unknown>;
     assert.equal(body['ok'], true);
-    assert.equal(body['cheap'], 'unknown', 'no health check wired');
   });
 });
 
@@ -509,23 +355,20 @@ describe('body limit', () => {
     upstream = await fakeServer(() => anthropicOk, seen);
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
-      ROUTER_MIN_CHEAP_PROBABILITY: '0.8', // the heuristic tops out at 0.825
-      CHEAP_API_KEY: 'unused',
       ANTHROPIC_UPSTREAM_URL: upstream.url,
       BODY_LIMIT_BYTES: '2000',
       LOG_LEVEL: 'fatal',
     });
     const router = new Router(new HeuristicClassifier(), new TtlLruStore<Tier>(100, 60_000), {
-      policy: { minCheapProbability: config.router.minCheapProbability, standardRoute: config.router.standardRoute },
+      policy: { minCheapProbability: config.router.minCheapProbability },
       primaryClasses: config.router.primaryClasses,
-      cheapContextTokens: 100_000,
       classifierTimeoutMs: 1_000,
       classifierMaxChars: 4_000,
     });
     proxy = buildServer({
       config,
       router,
-      providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      providers: { primary: new AnthropicProvider(config.primary) },
     });
     await proxy.listen({ host: '127.0.0.1', port: 0 });
     proxyUrl = `http://127.0.0.1:${(proxy.server.address() as AddressInfo).port}`;

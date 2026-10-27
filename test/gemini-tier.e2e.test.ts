@@ -85,6 +85,7 @@ describe('Gemini Tier E2E', () => {
       ANTHROPIC_UPSTREAM_URL: anthropicUrl,
       CHEAP_API_KEY: 'test-key',
       ANTHROPIC_API_KEY: 'test-key',
+      ARGON_TIER: 'off',
       LOG_LEVEL: 'fatal',
       JEV_ROUTER_HOME: dbDir,
       ...envOverrides
@@ -102,7 +103,7 @@ describe('Gemini Tier E2E', () => {
     };
 
     const router = new Router(classifier as any, store, {
-      policy: { minCheapProbability: 0.9, standardRoute: 'primary', standardEnabled: false },
+      policy: { minCheapProbability: 0.9, standardRoute: 'primary', standardEnabled: false, argonEnabled: config.argon.enabled },
       primaryClasses: new Set(['complex', 'auxiliary']),
       cheapContextTokens: 4000,
       ...(config.gemini ? {
@@ -155,7 +156,7 @@ describe('Gemini Tier E2E', () => {
         body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'hello' }] })
       });
       assert.equal(statusCode, 200);
-      assert.equal(headers['x-jev-route'], 'gemini; reason=gemini:text-only');
+      assert.equal(headers['x-jev-route'], 'free; reason=gemini:text-only');
       assert.equal(anthropicHits, 0);
       const data = await body.json() as any;
       assert.equal(data.content[0].text, 'gemini ok');
@@ -163,11 +164,11 @@ describe('Gemini Tier E2E', () => {
       // stream
       let res = await request(`${url}/v1/messages`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'e2e-stream' },
         body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'hello' }], stream: true })
       });
       assert.equal(res.statusCode, 200);
-      assert.equal(res.headers['x-jev-route'], 'gemini; reason=gemini:text-only');
+      assert.equal(res.headers['x-jev-route'], 'free; reason=gemini:text-only');
       assert.equal(anthropicHits, 0);
       await res.body.text();
     } finally {
@@ -314,7 +315,7 @@ describe('Gemini Tier E2E', () => {
       });
 
       const [r1, r2] = await Promise.all([p1, p2]);
-      assert.equal(r1.headers['x-jev-route'], 'gemini; reason=gemini:text-only');
+      assert.equal(r1.headers['x-jev-route'], 'free; reason=gemini:text-only');
       assert.equal(r2.headers['x-jev-route'], 'primary; reason=skipped:gemini-busy');
       assert.equal(spawnCalls, 1);
       assert.equal(anthropicHits, 1);
@@ -359,7 +360,7 @@ describe('Gemini Tier E2E', () => {
         { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
       ]);
-      assert.equal(loop.headers['x-jev-route'], 'gemini; reason=sticky');
+      assert.equal(loop.headers['x-jev-route'], 'free; reason=sticky');
       await loop.body.text();
     } finally {
       await proxy.close();

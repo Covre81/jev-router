@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { killTree } from '../cli-kill.js';
 import { existsSync, readdirSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,7 +10,9 @@ export interface CursorRunnerOptions {
   readonly bin: string;
   readonly model: string;
   readonly timeoutMs: number;
-  readonly signal?: AbortSignal;
+  readonly firstByteTimeoutMs?: number | undefined;
+  readonly idleTimeoutMs?: number | undefined;
+  readonly signal?: AbortSignal | undefined;
 }
 
 export type CursorResult =
@@ -73,16 +75,19 @@ export async function runCursorAgent(
   const launch = resolveCursorLaunch(opts.bin);
   if (!launch) return { ok: false, reason: 'cursor agent not found' };
 
-  const cwd = await mkdtemp(join(tmpdir(), 'jev-cursor-'));
+  const workspaceDir = await mkdtemp(join(tmpdir(), 'jev-cursor-'));
   try {
+    await writeFile(join(workspaceDir, 'prompt.md'), prompt, 'utf8');
+
     const args = [
       launch.indexJs,
       '-p',
       '--mode', 'ask',
       '--trust',
+      '--workspace', workspaceDir,
       '--output-format', 'stream-json',
       '--model', opts.model,
-      prompt,
+      'Read the file prompt.md in the workspace and follow it exactly. Output only your answer.',
     ];
     // Subscription login must win and lives in the real ~/.cursor: keep HOME/USERPROFILE,
     // strip API keys so the child can never bill an API account instead.
@@ -96,7 +101,7 @@ export async function runCursorAgent(
     }
 
     const child = spawnFn(launch.nodeExe, args, {
-      cwd,
+      cwd: workspaceDir,
       env: childEnv,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -111,12 +116,19 @@ export async function runCursorAgent(
     let segmentText = '';
     let aggregateText = '';
     let finalResult: any;
+    let firstByteReceived = false;
 
     return await new Promise<CursorResult>((resolve) => {
+      let firstByteTimer: NodeJS.Timeout | undefined;
+      let idleTimer: NodeJS.Timeout | undefined;
+      let overallTimer: NodeJS.Timeout | undefined;
+
       const settle = (r: CursorResult) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        if (firstByteTimer) clearTimeout(firstByteTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        if (overallTimer) clearTimeout(overallTimer);
         opts.signal?.removeEventListener('abort', abortHandler);
         resolve(r);
       };
@@ -124,16 +136,28 @@ export async function runCursorAgent(
         if (child.pid !== undefined) killTree(child.pid);
         settle({ ok: false, reason: 'aborted' });
       };
-      const timeout = setTimeout(() => {
+
+      const firstByteTimeoutMs = opts.firstByteTimeoutMs ?? 60_000;
+      const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
+
+      firstByteTimer = setTimeout(() => {
+        if (child.pid !== undefined) killTree(child.pid);
+        settle({ ok: false, reason: 'first-byte-timeout' });
+      }, firstByteTimeoutMs);
+
+      overallTimer = setTimeout(() => {
         if (child.pid !== undefined) killTree(child.pid);
         settle({ ok: false, reason: 'timeout' });
       }, opts.timeoutMs);
+
       if (opts.signal?.aborted) return settle({ ok: false, reason: 'aborted' });
       opts.signal?.addEventListener('abort', abortHandler);
 
       const handleEvent = (ev: any) => {
         if (!ev || typeof ev !== 'object') return;
         if (isToolStarted(ev)) {
+          // The prompt is delivered as workspace/prompt.md (argv is capped on Windows): reading it is expected.
+          if (isPromptFileRead(ev)) return;
           toolAttempted = toolKind(ev);
           if (child.pid !== undefined) killTree(child.pid);
           return;
@@ -150,6 +174,19 @@ export async function runCursorAgent(
       };
 
       child.stdout!.on('data', (chunk) => {
+        if (!firstByteReceived) {
+          firstByteReceived = true;
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+            firstByteTimer = undefined;
+          }
+        }
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (child.pid !== undefined) killTree(child.pid);
+          settle({ ok: false, reason: 'idle-timeout' });
+        }, idleTimeoutMs);
+
         stdoutBuffer += chunk.toString('utf8');
         const lines = stdoutBuffer.split('\n');
         stdoutBuffer = lines.pop() || '';
@@ -178,7 +215,11 @@ export async function runCursorAgent(
           return settle({ ok: false, reason: `result error${detail}` });
         }
         const text = (typeof finalResult.result === 'string' && finalResult.result.trim() ? finalResult.result : segmentText || aggregateText).trim();
-        if (!text) return settle({ ok: false, reason: 'empty response' });
+        if (!text) return settle({ ok: false, reason: 'empty' });
+        const lower = text.toLowerCase();
+        if (lower.includes('usage limit') || lower.includes('quota') || lower.includes('upgrade')) {
+          return settle({ ok: false, reason: `quota: ${text.slice(0, 100)}` });
+        }
         settle({
           ok: true,
           text,
@@ -190,6 +231,13 @@ export async function runCursorAgent(
       });
     });
   } finally {
-    try { await rm(cwd, { recursive: true, force: true }); } catch {}
+    try { await rm(workspaceDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+/** True when a tool event only reads the delivered prompt.md (the temp-file prompt channel). */
+export function isPromptFileRead(ev: unknown): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (!/read/i.test(toolKind(ev as any))) return false;
+  return /prompt\.md/.test(JSON.stringify(ev));
 }

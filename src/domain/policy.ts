@@ -1,102 +1,141 @@
 import type { ComplexityDistribution } from './complexity.js';
 
-/**
- * Where a conversation runs.
- *   cheap   — an OpenAI-compatible provider (Groq, OpenRouter, …), billed per token
- *   primary — Anthropic, the quota reserved for heavy lifting
- */
-export type Route = 'cheap' | 'gemini' | 'cursor' | 'primary';
+export type Route = 'free' | 'gemini' | 'argon' | 'cursor' | 'primary' | 'cheap';
 
-/**
- * Which model serves a conversation. `trivial` and `standard` are both the
- * cheap route (same OpenAI-compatible provider, different model); `primary`
- * is Anthropic. Ordered: a conversation's tier only moves up.
- */
-export type Tier = 'trivial' | 'standard' | 'gemini' | 'cursor' | 'primary';
+export type Tier = 'free' | 'gemini' | 'argon' | 'cursor' | 'primary' | 'trivial' | 'standard';
 
 export interface PolicyOptions {
-  /** Minimum P(simple) for the trivial tier (the small cheap model). */
-  readonly minCheapProbability: number;
-  /**
-   * Legacy, used only while the standard tier is off: `cheap` sends level-2
-   * mass to the trivial tier. Kept so an old .env keeps its behavior.
-   */
-  readonly standardRoute: Route;
-  /** A standard-tier model is configured (CHEAP_MODEL_STANDARD is not `off`). */
-  readonly standardEnabled?: boolean;
-  /** Minimum P(simple) + P(standard) for the standard tier. */
+  /** Minimum P(simple) for free tier. */
+  readonly minCheapProbability?: number;
+  /** Minimum P(simple) + P(standard) for standard/free tier. */
   readonly minStandardProbability?: number;
+  readonly argonEnabled?: boolean;
+  readonly standardRoute?: Route;
+  readonly standardEnabled?: boolean;
 }
 
-/**
- * Deterministic System-One decision.
- *
- * Not argmax: a distribution like {simple: .45, standard: .30, structural: .25}
- * has "simple" as its mode, yet a 55% chance the cheap model is out of its
- * depth. We send work to the cheap provider only when the probability mass of
- * cheap-eligible levels clears the bar; everything else stays on the primary.
- */
 export interface RiskScoresSummary {
   readonly security_sensitive: number;
   readonly destructive_or_production: number;
   readonly requires_inspection: number;
 }
 
-export function selectTier(
-  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
-  options: PolicyOptions,
-): Tier {
-  if (hardRiskVeto(d)) return 'primary';
+export const MAX_CHEAP_RISK = 0.5;
 
-  const inspectionVeto = (d.risk ?? 0) >= MAX_CHEAP_RISK;
-  if (!inspectionVeto && d.simple >= options.minCheapProbability) return 'trivial';
+export const ARGON_STRUCTURAL_HIGH = 0.45;
+export const ARGON_STRUCTURAL_MED = 0.3;
 
-  const lowMass = d.simple + d.standard;
-  if (options.standardEnabled) {
-    return lowMass >= (options.minStandardProbability ?? 1) ? 'standard' : 'primary';
-  }
-  if (inspectionVeto) return 'primary';
-  return options.standardRoute === 'cheap' && lowMass >= options.minCheapProbability ? 'trivial' : 'primary';
-}
-
-/** The route of `selectTier`: both cheap tiers are the cheap route. */
-export function selectRoute(d: ComplexityDistribution & { readonly risk?: number }, options: PolicyOptions): Route {
-  return tierRoute(selectTier(d, options));
-}
-
-export const tierRoute = (tier: Tier): Route =>
-  tier === 'primary' ? 'primary' : tier === 'gemini' ? 'gemini' : tier === 'cursor' ? 'cursor' : 'cheap';
-
-const TIER_RANK: Readonly<Record<Exclude<Tier, 'gemini' | 'cursor'>, number>> = { trivial: 0, standard: 1, primary: 2 };
+export type ArgonProfile = 'low' | 'medium' | 'high';
 
 /**
- * Escalate-only, across tiers: trivial → standard → primary. Bouncing down
- * would throw away the cache of the model the conversation moved up to.
+ * Hard risk veto: security or destructive signals veto every non-primary route.
  */
-export function stickyTier(current: Tier, proposed: Tier): Tier {
-  if ((current === 'gemini' || current === 'cursor') && proposed === current) return 'primary';
-  if (current === 'gemini' || current === 'cursor') return proposed === 'gemini' || proposed === 'cursor' ? current : proposed;
-  if (proposed === 'gemini' || proposed === 'cursor') return current;
-  return TIER_RANK[proposed] > TIER_RANK[current] ? proposed : current;
-}
-
-/**
- * A short request can be risky ("store the Stripe key in the code"): JEV calls
- * it simple, and it is, for the wrong reason. On scripts/eval-jev.ts the risk
- * Nouls split cleanly (simple prompts <= 0.15, risky >= 0.92), so 0.5 is not
- * a tuned knob.
- */
-// ponytail: fixed bar, make it a PolicyOptions field if the eval ever puts cases near it
-const MAX_CHEAP_RISK = 0.5;
-
-/** Same hard-risk rule selectTier uses: security/destructive scores veto every non-primary route. */
 export function hardRiskVeto(
-  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
+  d?: (ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary }) | undefined,
 ): boolean {
+  if (!d) return false;
   const hardRisk = d.riskScores
     ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
     : (d.risk ?? 0);
   return hardRisk >= MAX_CHEAP_RISK;
+}
+
+/**
+ * Select profile inside the Argon tier:
+ * - hardRiskVeto(d) -> null (straight to Claude)
+ * - structural >= 0.45 || requires_inspection >= 0.5 -> 'high'
+ * - structural >= 0.3 || standard >= 0.5 -> 'medium'
+ * - else 'low'
+ */
+export function selectArgonProfile(
+  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
+): ArgonProfile | null {
+  if (hardRiskVeto(d)) return null;
+
+  const requiresInspection = d.riskScores?.requires_inspection ?? 0;
+  if (d.structural >= ARGON_STRUCTURAL_HIGH || requiresInspection >= 0.5) {
+    return 'high';
+  }
+  if (d.structural >= ARGON_STRUCTURAL_MED || d.standard >= 0.5) {
+    return 'medium';
+  }
+  return 'low';
+}
+
+export function bumpArgonProfile(profile: ArgonProfile): ArgonProfile | null {
+  if (profile === 'low') return 'medium';
+  if (profile === 'medium') return 'high';
+  return null;
+}
+
+export const CURSOR_CODING_MAX_TEXT_ONLY = 0.75;
+export const CURSOR_CODING_MIN_MASS = 0.5;
+
+export function isCodingTurn(
+  d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary; readonly textOnly?: number },
+  options?: { readonly cursorCodingMaxTextOnly?: number | undefined; readonly cursorCodingMinMass?: number | undefined },
+): boolean {
+  if (hardRiskVeto(d)) return false;
+  const maxTextOnly = options?.cursorCodingMaxTextOnly ?? CURSOR_CODING_MAX_TEXT_ONLY;
+  const minMass = options?.cursorCodingMinMass ?? CURSOR_CODING_MIN_MASS;
+  const textOnly = d.textOnly ?? 1;
+  const mass = d.standard + d.structural;
+  return textOnly < maxTextOnly && mass >= minMass;
+}
+
+/**
+ * Deterministic System-One tier selection.
+ * Free (was trivial/standard) -> Argon -> Primary.
+ */
+export function selectTier(
+  d?: (ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary }) | undefined,
+  options: PolicyOptions = {},
+): 'free' | 'argon' | 'primary' {
+  if (!d) return 'primary';
+  if (hardRiskVeto(d)) return 'primary';
+
+  const inspectionVeto = (d.riskScores?.requires_inspection ?? (d.risk ?? 0)) >= MAX_CHEAP_RISK;
+  const minFree = options.minCheapProbability ?? 0.9;
+  if (!inspectionVeto && d.simple >= minFree) return 'free';
+
+  const lowMass = d.simple + d.standard;
+  const minStandard = options.minStandardProbability ?? 0.75;
+  if (!inspectionVeto && lowMass >= minStandard && options.standardEnabled !== false) {
+    return 'free';
+  }
+
+  if (options.argonEnabled !== false) {
+    return 'argon';
+  }
+
+  return 'primary';
+}
+
+export function selectRoute(d: ComplexityDistribution & { readonly risk?: number }, options: PolicyOptions = {}): Route {
+  return tierRoute(selectTier(d, options));
+}
+
+export const tierRoute = (tier: Tier): Route => {
+  if (tier === 'primary') return 'primary';
+  if (tier === 'cursor') return 'cursor';
+  if (tier === 'argon') return 'argon';
+  if (tier === 'gemini') return 'free';
+  return 'free';
+};
+
+const TIER_RANK: Readonly<Record<Tier, number>> = {
+  trivial: 0,
+  standard: 0,
+  free: 0,
+  gemini: 0,
+  argon: 1,
+  cursor: 1,
+  primary: 2,
+};
+
+export function stickyTier(current: Tier, proposed: Tier): Tier {
+  if (current === proposed) return current;
+  return TIER_RANK[proposed] > TIER_RANK[current] ? proposed : current;
 }
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -128,15 +167,6 @@ function bumpLadder(profile: PrimaryProfile): PrimaryProfile {
   return BUMP_LADDER[Math.min(idx + 1, BUMP_LADDER.length - 1)] ?? profile;
 }
 
-/**
- * Which Claude serves a conversation that lands on primary. Sonnet 5.5 costs
- * half of Opus 5.5 on every token kind (input, cache write, cache read,
- * output), so it takes work JEV does not call structural, and light
- * structural work (0.3-0.45) at high effort instead of Opus medium.
- * Opus xhigh is picked for hard-risk structural work or via escalation bump;
- * max is never picked (only a user's explicit /effort passes through).
- */
-// ponytail: bars are judgment, not tuned; move them to PolicyOptions once telemetry shows where they sit
 export function primaryProfile(
   d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
   escalation?: EscalationReason,
@@ -168,20 +198,14 @@ export function primaryProfile(
   return base;
 }
 
-/**
- * Escalate-only: once a conversation reaches the primary provider it stays
- * there. Bouncing back to the cheap model would throw away the Anthropic
- * prompt cache, which the next escalation would have to rebuild at full price.
- */
 export function stickyRoute(current: Route, proposed: Route): Route {
-  return current === 'primary' || proposed === 'primary' ? 'primary' : 'cheap';
+  return current === 'primary' || proposed === 'primary' ? 'primary' : proposed;
 }
 
 export interface GeminiPolicyOptions {
   readonly enabled: boolean;
   readonly minTextOnly: number;
   readonly pressureMinTextOnly: number;
-  /** Cheap route off: Gemini serves trivial/standard work itself, tools included, with no text-only bar. */
   readonly replacesCheap?: boolean;
 }
 
@@ -192,13 +216,9 @@ export function geminiEligible(
   quotaLevel: 'none' | 'pressure' | 'critical'
 ): boolean {
   if (!opts.enabled) return false;
-  // selectTier already ran the risk veto: a trivial/standard proposal is never risky.
-  if (opts.replacesCheap && (proposedTier === 'trivial' || proposedTier === 'standard')) return true;
+  if (opts.replacesCheap && (proposedTier === 'free' || proposedTier === 'gemini' || (proposedTier as string) === 'trivial' || (proposedTier as string) === 'standard')) return true;
   if (proposedTier !== 'primary') return false;
-  const hardRisk = d.riskScores
-    ? Math.max(d.riskScores.security_sensitive, d.riskScores.destructive_or_production)
-    : (d.risk ?? 0);
-  if (hardRisk >= MAX_CHEAP_RISK) return false;
+  if (hardRiskVeto(d)) return false;
 
   const bar = quotaLevel !== 'none' ? Math.min(opts.minTextOnly, opts.pressureMinTextOnly) : opts.minTextOnly;
   if (bar <= 0) return true;
