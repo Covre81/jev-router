@@ -162,7 +162,7 @@ export class GeminiCliProvider implements Provider {
     const res = await runAgy(prompt, runnerOpts, this.opts.spawnFn);
 
     if (!res.ok) {
-      return { kind: 'unavailable', reason: res.reason };
+      return { kind: 'unavailable', reason: res.reason, ...(res.quota ? { quota: res.quota } : {}) };
     }
 
     return anthropicResponseFromCliText({

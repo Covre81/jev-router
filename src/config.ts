@@ -12,6 +12,26 @@ export function expandEnv(str: string, env: NodeJS.ProcessEnv): string {
   return str.replace(/%([^%]+)%/g, (_, name) => env[name] ?? '');
 }
 
+export function parseModelMap(raw?: string): Record<string, string> {
+  if (!raw?.trim()) return {};
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {}
+  }
+  const map: Record<string, string> = {};
+  for (const part of trimmed.split(',')) {
+    const [k, v] = part.split(':').map((s) => s.trim());
+    if (k && v) map[k] = v;
+  }
+  return map;
+}
+
+export function resolveAgyClaudeModel(model: string, map?: Record<string, string>): string {
+  return map?.[model] ?? model;
+}
+
 const Env = z
   .object({
     HOST: z.string().default('127.0.0.1'),
@@ -74,6 +94,8 @@ const Env = z
     // Argon reasons silently for long stretches: its own no-output limits (Flash/Cursor keep TIER_*).
     ARGON_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
     ARGON_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+    AGY_CLAUDE_SUBSTITUTE: z.enum(['off', 'on']).default('on'),
+    AGY_CLAUDE_MODEL_MAP: z.string().optional(),
     CURSOR_TIER: z.enum(['off', 'on']).default('off'),
     CURSOR_TIER_BIN: z.string().optional(),
     CURSOR_TIER_MODEL: z.string().default('auto'),
@@ -82,6 +104,8 @@ const Env = z
     CURSOR_TIER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
     CURSOR_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     CURSOR_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
+    CURSOR_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
+    CURSOR_HANG_COOLDOWN_MS: z.coerce.number().int().positive().default(3_600_000),
     CURSOR_CODING: z.enum(['off', 'on']).default('on'),
     CURSOR_CODING_MAX_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.75),
     CURSOR_CODING_MIN_MASS: z.coerce.number().min(0).max(1).default(0.5),
@@ -213,6 +237,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       firstByteMs: e.ARGON_FIRST_BYTE_TIMEOUT_MS,
       idleMs: e.ARGON_IDLE_TIMEOUT_MS,
     },
+    agyClaude: {
+      substitute: e.AGY_CLAUDE_SUBSTITUTE === 'on',
+      modelMap: parseModelMap(e.AGY_CLAUDE_MODEL_MAP),
+    },
     cursor:
       e.CURSOR_TIER === 'off'
         ? undefined
@@ -220,6 +248,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
             bin: cursorBin,
             model: e.CURSOR_TIER_MODEL,
             timeoutMs: e.CURSOR_TIER_TIMEOUT_MS,
+            firstByteTimeoutMs: e.CURSOR_FIRST_BYTE_TIMEOUT_MS,
+            hangCooldownMs: e.CURSOR_HANG_COOLDOWN_MS,
             maxPromptChars: e.CURSOR_TIER_MAX_PROMPT_CHARS,
             maxConcurrency: e.CURSOR_TIER_MAX_CONCURRENCY,
             breakerFailures: e.CURSOR_TIER_BREAKER_FAILURES,

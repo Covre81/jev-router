@@ -3,7 +3,7 @@ import { Readable } from 'node:stream';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { Dispatcher } from 'undici';
 import type { BuildInfo } from '../build-info.js';
-import type { Config } from '../config.js';
+import { resolveAgyClaudeModel, type Config } from '../config.js';
 import {
   hardRiskVeto,
   selectArgonProfile,
@@ -16,6 +16,7 @@ import {
 } from '../domain/policy.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../providers/provider.js';
 import type { QuotaStore } from '../quota.js';
+import { ModelQuotaState, QUOTA_DEFAULT_COOLDOWN_MS } from '../providers/quota-state.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
 import { withPrimaryProfile } from '../routing/primary-profile.js';
@@ -35,6 +36,7 @@ export interface ServerDeps {
   readonly telemetry?: TelemetrySink;
   readonly build?: BuildInfo;
   readonly quota?: QuotaStore;
+  readonly quotaState?: ModelQuotaState;
   readonly geminiBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly argonBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly cursorBreaker?: import('../providers/breaker.js').CircuitBreaker;
@@ -58,6 +60,18 @@ function sameSecret(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+async function collectBodyBuffer(body: Readable | AsyncIterable<Buffer | string | Uint8Array>): Promise<Buffer> {
+  if (typeof (body as any).toArray === 'function') {
+    const arr = await (body as any).toArray();
+    return Buffer.concat(arr.map((c: any) => (typeof c === 'string' ? Buffer.from(c) : Buffer.from(c))));
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of body) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 let lastQuotaHeaderNamesStr: string | undefined;
 let loggedNoQuotaHeaders = false;
 
@@ -77,6 +91,7 @@ export function failureCode(reason: string): string {
     if (match) return match[0];
   }
   const low = reason.toLowerCase();
+  if (low.startsWith('quota')) return 'quota';
   if (low.includes('first-byte-timeout')) return 'first-byte-timeout';
   if (low.includes('idle-timeout')) return 'idle-timeout';
   if (low.includes('empty')) return 'empty';
@@ -139,6 +154,7 @@ export function buildServer({
   telemetry = noopTelemetry,
   build,
   quota,
+  quotaState: injectedQuotaState,
   geminiBreaker,
   argonBreaker,
   cursorBreaker,
@@ -151,6 +167,11 @@ export function buildServer({
     bodyLimit: config.bodyLimitBytes,
     exposeHeadRoutes: false,
   });
+
+  const quotaState = injectedQuotaState ?? new ModelQuotaState(() => Date.now(), app.log);
+
+  let cursorConsecutiveFirstByteTimeouts = 0;
+  let loggedCursorHang = false;
 
   const sendPrimary = async (req: ProviderRequest): Promise<ProviderResult> => {
     const result = await providers.primary.send(req);
@@ -191,17 +212,31 @@ export function buildServer({
     });
   }
 
-  app.get('/healthz', async () => ({
-    ok: true,
-    sha: build?.sha ?? null,
-    builtAt: build?.builtAt ?? null,
-    startedAt,
-    pid: process.pid,
-    quota: quota?.current() ? { ...quota.current(), level: quota.level() } : null,
-    gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
-    argon: config.argon.enabled ? { breaker: argonBreaker?.state, inFlight: argonBreaker?.inFlight } : null,
-    cursor: config.cursor ? { model: config.cursor.model, breaker: cursorBreaker?.state, inFlight: cursorBreaker?.inFlight } : null,
-  }));
+  app.get('/healthz', async () => {
+    const knownModels = [
+      config.gemini?.model ?? 'gemini-3.8-flash-high',
+      config.argon.modelLow,
+      config.argon.modelMedium,
+      config.argon.modelHigh,
+      resolveAgyClaudeModel('claude-sonnet-5-5-low', config.agyClaude?.modelMap),
+      resolveAgyClaudeModel('claude-sonnet-5-5-medium', config.agyClaude?.modelMap),
+      resolveAgyClaudeModel('claude-sonnet-5-5-high', config.agyClaude?.modelMap),
+      resolveAgyClaudeModel('claude-opus-5-5-high', config.agyClaude?.modelMap),
+      'cursor',
+    ];
+    return {
+      ok: true,
+      sha: build?.sha ?? null,
+      builtAt: build?.builtAt ?? null,
+      startedAt,
+      pid: process.pid,
+      quota: quota?.current() ? { ...quota.current(), level: quota.level() } : null,
+      gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
+      argon: config.argon.enabled ? { breaker: argonBreaker?.state, inFlight: argonBreaker?.inFlight } : null,
+      cursor: config.cursor ? { model: config.cursor.model, breaker: cursorBreaker?.state, inFlight: cursorBreaker?.inFlight } : null,
+      models: quotaState.snapshot(knownModels),
+    };
+  });
 
   const lastRoutes = new Map<string, { route: string; reason: string; at: string }>();
   app.get<{ Params: { session: string } }>('/route/:session', async (req, reply) => {
@@ -307,7 +342,6 @@ export function buildServer({
                 ? (modelOverride ?? config.argon.modelMedium)
                 : (modelOverride ?? config.cursor?.model ?? 'auto'),
         requestedModel: base.body!.model,
-        // The body's effort is Claude's; flash/cursor have none, argon passes its profile.
         effort:
           effortOverride ??
           (route === 'primary' ? (base.body!['output_config'] as { effort?: string } | undefined)?.effort : undefined),
@@ -318,11 +352,19 @@ export function buildServer({
       };
     };
 
-    const tryCursor = async (r: ProviderRequest): Promise<ProviderResult | undefined> => {
+    const tryCursor = async (
+      r: ProviderRequest,
+    ): Promise<
+      | { kind: 'response'; result: ProviderResult }
+      | { kind: 'quota'; resetAt: number }
+      | { kind: 'skipped' }
+      | { kind: 'failed'; reason: string }
+    > => {
       const provider = providers.cursor;
       const breaker = cursorBreaker;
-      if (!provider || !breaker || breaker.state === 'open') return undefined;
-      if (!breaker.acquire()) return undefined;
+      if (!provider || !breaker || breaker.state === 'open') return { kind: 'skipped' };
+      if (!quotaState.isAvailable('cursor')) return { kind: 'quota', resetAt: 0 };
+      if (!breaker.acquire()) return { kind: 'skipped' };
       const hopStart = performance.now();
       let outcome: 'success' | 'failure' | 'neutral' = 'failure';
       try {
@@ -333,11 +375,32 @@ export function buildServer({
           const rawReason = err instanceof Error ? err.message : String(err);
           logHopFailure('cursor', rawReason, performance.now() - hopStart);
           upstreamFailureState = { failure: failureCode(rawReason) };
-          return undefined;
+          if (rawReason.includes('first-byte-timeout')) {
+            cursorConsecutiveFirstByteTimeouts++;
+            const maxFailures = config.cursor?.breakerFailures ?? 3;
+            if (cursorConsecutiveFirstByteTimeouts >= maxFailures) {
+              const hangCooldown = config.cursor?.hangCooldownMs ?? 3_600_000;
+              cursorBreaker?.forceOpen(hangCooldown);
+              if (!loggedCursorHang) {
+                loggedCursorHang = true;
+                req.log.warn('cursor disabled: repeated first-byte timeouts (check auth/session: scheduled task S4U?)');
+              }
+            }
+          }
+          return { kind: 'failed', reason: rawReason };
         }
         if (res.kind === 'response') {
           outcome = 'success';
-          return res;
+          cursorConsecutiveFirstByteTimeouts = 0;
+          loggedCursorHang = false;
+          return { kind: 'response', result: res };
+        }
+        if (res.quota || res.reason === 'quota' || res.reason.startsWith('quota')) {
+          outcome = 'neutral';
+          const resetAt = res.quota?.resetAt ?? (Date.now() + QUOTA_DEFAULT_COOLDOWN_MS);
+          quotaState.markExhausted('cursor', resetAt, res.reason);
+          logHopFailure('cursor', 'quota', performance.now() - hopStart);
+          return { kind: 'quota', resetAt };
         }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
         const overBudget = res.reason === 'transcript budget exceeded';
@@ -346,7 +409,19 @@ export function buildServer({
         upstreamFailureState = { failure: failureCode(res.reason) };
         const statusMatch = res.reason.match(/^HTTP (\d+)/);
         if (statusMatch && statusMatch[1]) upstreamFailureState.status = parseInt(statusMatch[1], 10);
-        return undefined;
+        if (res.reason.includes('first-byte-timeout')) {
+          cursorConsecutiveFirstByteTimeouts++;
+          const maxFailures = config.cursor?.breakerFailures ?? 3;
+          if (cursorConsecutiveFirstByteTimeouts >= maxFailures) {
+            const hangCooldown = config.cursor?.hangCooldownMs ?? 3_600_000;
+            cursorBreaker?.forceOpen(hangCooldown);
+            if (!loggedCursorHang) {
+              loggedCursorHang = true;
+              req.log.warn('cursor disabled: repeated first-byte timeouts (check auth/session: scheduled task S4U?)');
+            }
+          }
+        }
+        return { kind: 'failed', reason: res.reason };
       } finally {
         breaker.release(outcome);
       }
@@ -354,10 +429,15 @@ export function buildServer({
 
     type FlashResult =
       | { kind: 'response'; result: ProviderResult }
+      | { kind: 'quota'; resetAt: number }
       | { kind: 'skipped'; reason: 'skipped:gemini-busy' | 'skipped:gemini-unhealthy' }
       | { kind: 'failed'; reason: 'failover:gemini-unavailable' };
 
     const tryFlash = async (r: ProviderRequest): Promise<FlashResult> => {
+      const flashModel = config.gemini?.model ?? 'gemini-3.8-flash-high';
+      if (!quotaState.isAvailable(flashModel)) {
+        return { kind: 'quota', resetAt: 0 };
+      }
       const provider = providers.gemini;
       const breaker = geminiBreaker;
       if (!provider || !breaker || breaker.state === 'open') {
@@ -384,6 +464,13 @@ export function buildServer({
           outcome = 'success';
           return { kind: 'response', result: res };
         }
+        if (res.quota || res.reason === 'quota' || res.reason.startsWith('quota')) {
+          outcome = 'neutral';
+          const resetAt = res.quota?.resetAt ?? (Date.now() + QUOTA_DEFAULT_COOLDOWN_MS);
+          quotaState.markExhausted(flashModel, resetAt, res.reason);
+          logHopFailure('flash', 'quota', performance.now() - hopStart);
+          return { kind: 'quota', resetAt };
+        }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
         const overBudget = res.reason === 'transcript budget exceeded';
         if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
@@ -403,10 +490,20 @@ export function buildServer({
       return config.argon.modelMedium;
     };
 
+    type ArgonResult =
+      | { kind: 'response'; result: ProviderResult }
+      | { kind: 'quota'; resetAt: number }
+      | { kind: 'skipped' }
+      | { kind: 'failed'; reason: string };
+
     const tryArgon = async (
       profile: ArgonProfile,
       r: ProviderRequest,
-    ): Promise<{ kind: 'response'; result: ProviderResult } | { kind: 'skipped' } | { kind: 'failed'; reason: string }> => {
+    ): Promise<ArgonResult> => {
+      const model = getArgonModel(profile);
+      if (!quotaState.isAvailable(model)) {
+        return { kind: 'quota', resetAt: 0 };
+      }
       const provider = providers.gemini;
       const breaker = argonBreaker ?? geminiBreaker;
       if (!config.argon.enabled || !provider || !breaker || breaker.state === 'open') {
@@ -416,7 +513,6 @@ export function buildServer({
         return { kind: 'skipped' };
       }
       const hopStart = performance.now();
-      const model = getArgonModel(profile);
       let outcome: 'success' | 'failure' | 'neutral' = 'failure';
       try {
         let res: ProviderResult;
@@ -432,6 +528,13 @@ export function buildServer({
           outcome = 'success';
           return { kind: 'response', result: res };
         }
+        if (res.quota || res.reason === 'quota' || res.reason.startsWith('quota')) {
+          outcome = 'neutral';
+          const resetAt = res.quota?.resetAt ?? (Date.now() + QUOTA_DEFAULT_COOLDOWN_MS);
+          quotaState.markExhausted(model, resetAt, res.reason);
+          logHopFailure('argon', `quota (${model})`, performance.now() - hopStart);
+          return { kind: 'quota', resetAt };
+        }
         const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
         const overBudget = res.reason === 'transcript budget exceeded';
         if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
@@ -445,6 +548,58 @@ export function buildServer({
       }
     };
 
+    const tryAgyClaude = async (
+      modelName: string,
+      r: ProviderRequest,
+    ): Promise<{ kind: 'response'; result: ProviderResult } | { kind: 'skipped' } | { kind: 'quota'; resetAt: number } | { kind: 'failed'; reason: string }> => {
+      if (!config.agyClaude?.substitute || !providers.gemini) {
+        return { kind: 'skipped' };
+      }
+      const mappedModel = resolveAgyClaudeModel(modelName, config.agyClaude.modelMap);
+      if (!quotaState.isAvailable(mappedModel)) {
+        return { kind: 'quota', resetAt: 0 };
+      }
+      const breaker = geminiBreaker;
+      if (breaker && breaker.state === 'open') {
+        return { kind: 'skipped' };
+      }
+      if (breaker && !breaker.acquire()) {
+        return { kind: 'skipped' };
+      }
+      const hopStart = performance.now();
+      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
+      try {
+        let res: ProviderResult;
+        try {
+          res = await providers.gemini.send({ ...r, modelOverride: mappedModel });
+        } catch (err) {
+          const rawReason = err instanceof Error ? err.message : String(err);
+          logHopFailure('flash', rawReason, performance.now() - hopStart);
+          upstreamFailureState = { failure: failureCode(rawReason) };
+          return { kind: 'failed', reason: rawReason };
+        }
+        if (res.kind === 'response') {
+          outcome = 'success';
+          return { kind: 'response', result: res };
+        }
+        if (res.quota || res.reason === 'quota' || res.reason.startsWith('quota')) {
+          outcome = 'neutral';
+          const resetAt = res.quota?.resetAt ?? (Date.now() + QUOTA_DEFAULT_COOLDOWN_MS);
+          quotaState.markExhausted(mappedModel, resetAt, res.reason);
+          logHopFailure('flash', `quota (${mappedModel})`, performance.now() - hopStart);
+          return { kind: 'quota', resetAt };
+        }
+        const isRoutingMiss = res.reason === 'model asked for tools' || res.reason.startsWith('tool attempt:');
+        const overBudget = res.reason === 'transcript budget exceeded';
+        if (res.reason === 'aborted' || isRoutingMiss || overBudget) outcome = 'neutral';
+        logHopFailure('flash', res.reason, performance.now() - hopStart);
+        upstreamFailureState = { failure: failureCode(res.reason) };
+        return { kind: 'failed', reason: res.reason };
+      } finally {
+        breaker?.release(outcome);
+      }
+    };
+
     const sendClaude = async (
       b: ProviderRequest,
       dec: RouteDecision,
@@ -454,7 +609,8 @@ export function buildServer({
       if (!profile || !profiled) return { result: await sendPrimary(b), dec };
       const first = await sendPrimary({ ...b, rawBody: profiled });
       if (first.kind !== 'response' || first.status !== 400) return { result: first, dec, served: profile };
-      const error = Buffer.concat(await first.body.toArray()).toString('utf8').slice(0, 500);
+      const errorBuf = await collectBodyBuffer(first.body);
+      const error = errorBuf.toString('utf8').slice(0, 500);
       const result = await sendPrimary(b);
       if (result.kind !== 'response' || result.status < 200 || result.status >= 300) return { result, dec };
       req.log.warn({ profile, error }, 'primary profile refused, cleared');
@@ -478,20 +634,51 @@ export function buildServer({
       const servedModel = exch?.model ?? (dec.route === 'primary' ? base.body!.model : config.gemini?.model ?? 'gemini-3.8-flash-high');
       const servedEffort = exch?.effort;
       req.log.info(
-        { route: dec.route, tier: dec.tier ?? dec.route, model: servedModel, effort: servedEffort, reason: dec.reason },
+        {
+          route: dec.route,
+          tier: dec.tier ?? dec.route,
+          model: servedModel,
+          effort: servedEffort,
+          reason: dec.reason,
+          ...(dec.substitutedFrom ? { substitutedFrom: dec.substitutedFrom } : {}),
+        },
         'routing decision',
       );
 
       if (keepAlive && keepAlive.didSendHeaders()) {
+        const audited = dec && exch;
         if (result.kind === 'response') {
-          for await (const chunk of result.body) {
-            reply.raw.write(chunk);
+          if (result.status >= 400) {
+            const errBuf = await collectBodyBuffer(result.body);
+            const errStr = errBuf.toString('utf8');
+            let errJson: string;
+            try {
+              const parsed = JSON.parse(errStr);
+              if (parsed && typeof parsed === 'object' && parsed.type === 'error') {
+                errJson = errStr;
+              } else {
+                errJson = JSON.stringify(anthropicError('api_error', errStr || `HTTP ${result.status}`));
+              }
+            } catch {
+              errJson = JSON.stringify(anthropicError('api_error', errStr || `HTTP ${result.status}`));
+            }
+            reply.raw.write(`event: error\ndata: ${errJson}\n\n`);
+            reply.raw.end();
+          } else {
+            const body = audited
+              ? auditExchange(telemetry, reply.raw, result, dec, exch, (err) =>
+                  reply.log.warn({ err }, 'telemetry failed'),
+                )
+              : result.body;
+            for await (const chunk of body) {
+              reply.raw.write(chunk);
+            }
+            reply.raw.end();
           }
-          reply.raw.end();
         } else {
-          reply.raw.write(
-            `event: error\ndata: {"type":"error","error":{"type":"api_error","message":"jev-router: ${result.reason}"}}\n\n`,
-          );
+          if (audited) auditFailure(telemetry, dec, exch, result.reason);
+          const errJson = JSON.stringify(anthropicError('api_error', `jev-router: ${result.reason}`));
+          reply.raw.write(`event: error\ndata: ${errJson}\n\n`);
           reply.raw.end();
         }
         return reply;
@@ -499,12 +686,70 @@ export function buildServer({
       return relay(reply, result, dec, req, exch);
     };
 
+    const runArgonQuotaLadder = async (
+      startingProfile: ArgonProfile,
+      fromModel: string,
+    ): Promise<FastifyReply> => {
+      // 1. Argon models from startingProfile up to high
+      let curProf: ArgonProfile | null = startingProfile;
+      while (curProf !== null) {
+        const argonAttempt = await tryArgon(curProf, activeBase);
+        if (argonAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'argon');
+          const argonModel = getArgonModel(curProf);
+          const reason: RouteReason = `quota-substitute:${fromModel}->${argonModel}`;
+          const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason, substitutedFrom: fromModel };
+          return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProf));
+        }
+        curProf = bumpArgonProfile(curProf);
+      }
+
+      // 2. Agy claude substitute
+      const agyClaudeSubModel =
+        startingProfile === 'high'
+          ? 'claude-opus-5-5-high'
+          : startingProfile === 'medium'
+            ? 'claude-sonnet-5-5-high'
+            : 'claude-sonnet-5-5-medium';
+
+      const agyClaudeAttempt = await tryAgyClaude(agyClaudeSubModel, activeBase);
+      if (agyClaudeAttempt.kind === 'response') {
+        router.markFallbackLoop(decision, 'free');
+        const reason: RouteReason = `quota-substitute:${fromModel}->${agyClaudeSubModel}`;
+        const routeDec: RouteDecision = { ...decision, route: 'free', tier: 'free', reason, substitutedFrom: fromModel };
+        return safeRelay(agyClaudeAttempt.result, routeDec, exchange('free', agyClaudeSubModel));
+      }
+
+      // 3. Anthropic Claude floor:
+      const claudeFloor: PrimaryProfile =
+        startingProfile === 'high'
+          ? { model: 'claude-opus-5-5', effort: 'high' }
+          : startingProfile === 'medium'
+            ? { model: 'claude-sonnet-5-5', effort: 'high' }
+            : { model: 'claude-sonnet-5-5', effort: 'medium' };
+
+      router.clearFallbackLoop(decision, 'primary');
+      const reason: RouteReason = `quota-substitute:${fromModel}->claude`;
+      const routeDec: RouteDecision = await router.profileForFallback(
+        { ...decision, route: 'primary', tier: 'primary', reason, substitutedFrom: fromModel },
+        context,
+        'gemini-failed',
+        claudeFloor,
+      );
+      return relayClaude(base, routeDec);
+    };
+
     // Execution chain based on routed decision
     if (decision.route === 'cursor') {
-      const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? undefined : await tryCursor(activeBase);
-      if (cursorRes) {
+      const cursorRes = hasImageDocumentOrToolChoice(base.body!) ? ({ kind: 'skipped' as const }) : await tryCursor(activeBase);
+      if (cursorRes.kind === 'response') {
         router.markFallbackLoop(decision, 'cursor');
-        return safeRelay(cursorRes, decision, exchange('cursor'));
+        return safeRelay(cursorRes.result, decision, exchange('cursor'));
+      }
+
+      if (cursorRes.kind === 'quota') {
+        const startingProfile: ArgonProfile = selectArgonProfile(decision.distribution ?? { simple: 0, standard: 1, structural: 0 }) ?? 'low';
+        return runArgonQuotaLadder(startingProfile, 'cursor');
       }
 
       // Cursor failed -> fall back to Argon (starting profile from selectArgonProfile)
@@ -516,6 +761,9 @@ export function buildServer({
           const argonModel = getArgonModel(curProfile);
           const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason: 'escalated:cursor-failed' };
           return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
+        }
+        if (argonAttempt.kind === 'quota') {
+          return runArgonQuotaLadder(curProfile, getArgonModel(curProfile));
         }
         if (argonAttempt.kind === 'skipped') {
           break; // skip without bump to Claude
@@ -535,11 +783,46 @@ export function buildServer({
 
     if (decision.route === 'free') {
       const flashRes = hasImageDocumentOrToolChoice(base.body!)
-        ? { kind: 'skipped' as const, reason: 'skipped:gemini-unhealthy' as const }
+        ? ({ kind: 'skipped' as const, reason: 'skipped:gemini-unhealthy' as const })
         : await tryFlash(activeBase);
       if (flashRes.kind === 'response') {
         router.markFallbackLoop(decision, 'free');
         return safeRelay(flashRes.result, decision, exchange('free', config.gemini?.model));
+      }
+
+      const flashModel = config.gemini?.model ?? 'gemini-3.8-flash-high';
+      if (flashRes.kind === 'quota') {
+        // Flash exhausted substitution ladder
+        if (config.argon.enabled) {
+          for (const prof of ['low', 'medium', 'high'] as const) {
+            const argonAttempt = await tryArgon(prof, activeBase);
+            if (argonAttempt.kind === 'response') {
+              router.markFallbackLoop(decision, 'argon');
+              const argonModel = getArgonModel(prof);
+              const reason: RouteReason = `quota-substitute:${flashModel}->${argonModel}`;
+              const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason, substitutedFrom: flashModel };
+              return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, prof));
+            }
+          }
+        }
+        // agy claude-sonnet-5-5-low
+        const agyClaudeAttempt = await tryAgyClaude('claude-sonnet-5-5-low', activeBase);
+        if (agyClaudeAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'free');
+          const reason: RouteReason = `quota-substitute:${flashModel}->claude-sonnet-5-5-low`;
+          const routeDec: RouteDecision = { ...decision, route: 'free', tier: 'free', reason, substitutedFrom: flashModel };
+          return safeRelay(agyClaudeAttempt.result, routeDec, exchange('free', 'claude-sonnet-5-5-low'));
+        }
+        // Anthropic with floor sonnet low
+        router.clearGeminiLoop(decision, 'primary');
+        const reason: RouteReason = `quota-substitute:${flashModel}->claude`;
+        const routeDec: RouteDecision = await router.profileForFallback(
+          { ...decision, route: 'primary', tier: 'primary', reason, substitutedFrom: flashModel },
+          context,
+          'gemini-failed',
+          { model: 'claude-sonnet-5-5', effort: 'low' },
+        );
+        return relayClaude(base, routeDec);
       }
 
       const flashFailureReason = flashRes.reason;
@@ -553,6 +836,9 @@ export function buildServer({
             const argonModel = getArgonModel(curProfile);
             const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason: 'escalated:flash-failed' };
             return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
+          }
+          if (argonAttempt.kind === 'quota') {
+            return runArgonQuotaLadder(curProfile, getArgonModel(curProfile));
           }
           if (argonAttempt.kind === 'skipped') {
             break;
@@ -587,6 +873,10 @@ export function buildServer({
           const reason: RouteReason = isFirst ? (`argon:${curProfile}` as RouteReason) : 'escalated:argon-failed';
           const routeDec: RouteDecision = { ...decision, route: 'argon', tier: 'argon', reason };
           return safeRelay(argonAttempt.result, routeDec, exchange('argon', argonModel, curProfile));
+        }
+        if (argonAttempt.kind === 'quota') {
+          const argonModel = getArgonModel(curProfile);
+          return runArgonQuotaLadder(curProfile, argonModel);
         }
         if (argonAttempt.kind === 'skipped') {
           break;
@@ -627,7 +917,7 @@ export function buildServer({
     const quotaHeaderNames = rateLimitHeaderNames(primary.headers);
     req.log.warn({ status: primary.status, quotaHeaderNames, conversation: decision.conversationKey }, 'primary rate-limited, failing over (cascade Cursor -> Gemini)');
 
-    const errorBody = Buffer.concat(await primary.body.toArray());
+    const errorBody = await collectBodyBuffer(primary.body);
     const skipCli = hasImageDocumentOrToolChoice(base.body!);
     const primaryFailure = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
 
@@ -640,11 +930,11 @@ export function buildServer({
 
     if (!skipCli) {
       const cursorRes = await tryCursor(activeBase);
-      if (cursorRes) {
+      if (cursorRes.kind === 'response') {
         router.markFallbackLoop(decision, 'cursor');
         upstreamFailureState = primaryFailure;
         return safeRelay(
-          cursorRes,
+          cursorRes.result,
           { ...decision, route: 'cursor', tier: 'cursor', reason: 'failover:primary-rate-limited', fallbackLoop: 'cursor' },
           exchange('cursor'),
         );
@@ -705,6 +995,9 @@ export function buildServer({
     }
     if (decision) {
       reply.header('x-jev-route', `${decision.route}; reason=${decision.reason}`);
+      if (decision.substitutedFrom) {
+        reply.header('x-jev-substituted-from', decision.substitutedFrom);
+      }
       const key = decision.conversationKey;
       if (key?.endsWith(':main')) {
         lastRoutes.delete(key);

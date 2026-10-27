@@ -167,6 +167,15 @@ function bumpLadder(profile: PrimaryProfile): PrimaryProfile {
   return BUMP_LADDER[Math.min(idx + 1, BUMP_LADDER.length - 1)] ?? profile;
 }
 
+export function raiseToFloor(profile: PrimaryProfile, floor: PrimaryProfile): PrimaryProfile {
+  const profileIdx = BUMP_LADDER.findIndex((p) => p.model === profile.model && p.effort === profile.effort);
+  const floorIdx = BUMP_LADDER.findIndex((p) => p.model === floor.model && p.effort === floor.effort);
+  if (profileIdx === -1 || floorIdx === -1) {
+    return profile;
+  }
+  return profileIdx < floorIdx ? BUMP_LADDER[floorIdx]! : profile;
+}
+
 export function primaryProfile(
   d: ComplexityDistribution & { readonly risk?: number; readonly riskScores?: RiskScoresSummary },
   escalation?: EscalationReason,

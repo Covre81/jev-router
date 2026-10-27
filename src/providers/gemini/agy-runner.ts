@@ -3,6 +3,7 @@ import { killTree } from '../cli-kill.js';
 import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parseQuotaError } from '../quota-state.js';
 
 export interface AgyRunnerOptions {
   readonly bin: string;
@@ -16,7 +17,7 @@ export interface AgyRunnerOptions {
 
 export type AgyResult =
   | { readonly ok: true; readonly text: string; readonly usage: { readonly inputTokens: number; readonly outputTokens: number } }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: string; readonly quota?: { readonly resetAt: number } | undefined };
 
 export type SpawnAgy = (bin: string, args: string[], options: any) => ChildProcess;
 
@@ -65,6 +66,7 @@ export async function runAgy(
     let finalResult: any = undefined;
     let toolAttempted: string | false = false;
     let stdoutBuffer = '';
+    let stderrText = '';
     let textDelta = '';
     let firstByteReceived = false;
 
@@ -152,6 +154,10 @@ export async function runAgy(
         }
       });
 
+      child.stderr!.on('data', (chunk) => {
+        stderrText = (stderrText + chunk.toString('utf8')).slice(-1000);
+      });
+
       child.on('error', (err) => {
         settle({ ok: false, reason: `spawn failed: ${err.message}` });
       });
@@ -170,6 +176,20 @@ export async function runAgy(
         if (opts.signal?.aborted) {
           return settle({ ok: false, reason: 'aborted' });
         }
+
+        // Check for quota error in any of the error outputs
+        const errCandidate = [
+          finalResult?.error,
+          finalResult?.response,
+          textDelta,
+          stderrText,
+        ].filter(Boolean).join(' ');
+
+        const quotaParsed = parseQuotaError(errCandidate);
+        if (quotaParsed) {
+          return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+        }
+
         if (code !== 0) {
           const reasonMsg = (finalResult && finalResult.status === 'ERROR' && finalResult.error) ? finalResult.error : '';
           if (finalResult && finalResult.status === 'ERROR') {
@@ -187,6 +207,11 @@ export async function runAgy(
         const responseText = (finalResult.response || textDelta).trim();
         if (!responseText) {
           return settle({ ok: false, reason: 'empty' });
+        }
+
+        const quotaInResponse = parseQuotaError(responseText);
+        if (quotaInResponse) {
+          return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaInResponse.resetAt } });
         }
         
         settle({
