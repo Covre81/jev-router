@@ -34,7 +34,7 @@ describe('Gemini tier unit tests', () => {
       const c = loadConfig({ CHEAP_API_KEY: 'k', CLASSIFIER: 'heuristic', GEMINI_TIER: 'on', JEV_ROUTER_HOME: '/jev-home' });
       assert.ok(c.gemini);
       assert.equal(c.gemini.model, 'gemini-3.8-flash-high');
-      assert.equal(c.gemini.timeoutMs, 60000);
+      assert.equal(c.gemini.timeoutMs, 300000);
       assert.equal(c.gemini.minTextOnly, 0.8);
       assert.equal(c.gemini.pressureMinTextOnly, 0.6);
       assert.equal(c.gemini.fromPrimary, true);
@@ -287,7 +287,7 @@ describe('Gemini tier unit tests', () => {
         return fakeChild;
       };
       const res = await runAgy('hello', { bin: 'agy', model: 'm1', timeoutMs: 1000, home: '/tmp/home' }, spawnFn as any);
-      assert.deepEqual(res, { ok: false, reason: 'empty response' });
+      assert.deepEqual(res, { ok: false, reason: 'empty' });
     });
 
     it('abort signal', async () => {

@@ -118,16 +118,15 @@ describe('expect: 100-continue and wedged pool fixes', () => {
         LOG_LEVEL: 'fatal',
       });
       const router = new Router(new HeuristicClassifier(), new TtlLruStore<Tier>(100, 60_000), {
-        policy: { minCheapProbability: config.router.minCheapProbability, standardRoute: config.router.standardRoute },
+        policy: { minCheapProbability: config.router.minCheapProbability },
         primaryClasses: config.router.primaryClasses,
-        cheapContextTokens: 100_000,
         classifierTimeoutMs: 1_000,
         classifierMaxChars: 4_000,
       });
       proxy = buildServer({
         config,
         router,
-        providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+        providers: { primary: new AnthropicProvider(config.primary) },
       });
       await proxy.listen({ host: '127.0.0.1', port: 0 });
       proxyUrl = `http://127.0.0.1:${(proxy.server.address() as AddressInfo).port}`;

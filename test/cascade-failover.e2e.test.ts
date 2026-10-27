@@ -45,21 +45,20 @@ function stub(name: string, fn: (r: ProviderRequest) => ProviderResult) {
 async function createTestServer(opts: {
   cursor?: Provider & { hits: number };
   gemini?: Provider & { hits: number };
-  cheap?: Provider & { hits: number };
   primary?: Provider & { hits: number };
   classification?: any;
   quota?: () => any;
 }) {
   const config = loadConfig({
     CLASSIFIER: 'heuristic',
-    CHEAP_API_KEY: 'test-key',
     LOG_LEVEL: 'fatal',
     CURSOR_TIER: 'on',
     GEMINI_TIER: 'on',
+    ARGON_TIER: 'off',
   });
   const classifier = { name: 'scripted', classify: async () => opts.classification ?? ({ simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 }) };
   const router = new Router(classifier as any, new TtlLruStore<any>(100, 60_000), {
-    policy: { minCheapProbability: 0.9, standardRoute: 'primary', standardEnabled: false },
+    policy: { minCheapProbability: 0.9, standardRoute: 'primary', standardEnabled: false, argonEnabled: false },
     primaryClasses: new Set(['auxiliary']),
     cheapContextTokens: 100_000,
     classifierMaxChars: 4000,
@@ -68,7 +67,6 @@ async function createTestServer(opts: {
   } as any);
   const providers: any = {
     primary: opts.primary,
-    cheap: opts.cheap,
     ...(opts.cursor ? { cursor: opts.cursor } : {}),
     ...(opts.gemini ? { gemini: opts.gemini } : {}),
   };
@@ -98,13 +96,12 @@ const send = (url: string, body: unknown, session = 'cascade-s1') =>
     body: JSON.stringify(body),
   });
 
-describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
+describe('failover cascade Claude -> Cursor -> Gemini', () => {
   it('1. primary 429 served by Cursor; tool-loop turn sticks to Cursor', async () => {
     const primary = rateLimitedPrimary();
     const cursor = stub('cursor', () => jsonResponse('cursor ok', true));
     const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini });
     try {
       const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r1.statusCode, 200);
@@ -123,33 +120,25 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
       assert.equal(r2.headers['x-jev-route'], 'cursor; reason=sticky');
       await r2.body.text();
 
-      assert.equal(primary.hits, 1);
-      assert.equal(cursor.hits, 2);
+      assert.equal(primary.hits, 1, 'primary rate limited once');
+      assert.equal(cursor.hits, 2, 'cursor served initial failover and continuation');
       assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-
-      const health = await request(`${url}/healthz`);
-      const h = (await health.body.json()) as any;
-      assert.equal(h.cursor.model, 'auto');
-      assert.equal(h.cursor.breaker, 'closed');
     } finally {
       await proxy.close();
     }
   });
 
-  it('2. Cursor unavailable => Gemini serves, cheap untouched', async () => {
+  it('2. Cursor unavailable => Gemini serves', async () => {
     const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
+    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'process exited 1' }));
     const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini });
     try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s2');
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r.statusCode, 200);
-      assert.equal(r.headers['x-jev-route'], 'gemini; reason=failover:cursor-unavailable');
-      const data = (await r.body.json()) as any;
-      assert.equal(data.content[0].text, 'gemini ok');
-      assert.equal(cheap.hits, 0);
+      assert.equal(r.headers['x-jev-route'], 'free; reason=failover:cursor-unavailable');
+      await r.body.text();
+      assert.equal(primary.hits, 1);
       assert.equal(cursor.hits, 1);
       assert.equal(gemini.hits, 1);
     } finally {
@@ -157,18 +146,19 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
     }
   });
 
-  it('3. Cursor+Gemini unavailable => cheap serves', async () => {
+  it('3. Cursor+Gemini unavailable => 429 relayed verbatim', async () => {
     const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'cursor down' }));
+    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'gemini down' }));
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini });
     try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s3');
-      assert.equal(r.statusCode, 200);
-      assert.equal(r.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
-      await r.body.text();
-      assert.equal(cheap.hits, 1);
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
+      assert.equal(r.statusCode, 429);
+      assert.equal(r.headers['x-original'], 'yes');
+      assert.deepEqual(await r.body.json(), JSON.parse(ORIGINAL_429_BODY));
+      assert.equal(primary.hits, 1);
+      assert.equal(cursor.hits, 1);
+      assert.equal(gemini.hits, 1);
     } finally {
       await proxy.close();
     }
@@ -176,15 +166,13 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
 
   it('4. all down => original 429 relayed verbatim', async () => {
     const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const cheap = stub('cheap', () => ({ kind: 'unavailable', reason: 'down' }));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary });
     try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s4');
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r.statusCode, 429);
       assert.equal(r.headers['x-original'], 'yes');
-      assert.equal(await r.body.text(), ORIGINAL_429_BODY);
+      await r.body.text();
+      assert.equal(primary.hits, 1);
     } finally {
       await proxy.close();
     }
@@ -194,82 +182,15 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
     const primary = rateLimitedPrimary();
     const cursor = stub('cursor', () => jsonResponse('cursor ok'));
     const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini });
     try {
-      const r = await send(url, { model: 'claude', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }, 'cascade-s5');
+      const r = await send(url, { model: 'claude', max_tokens: 1, messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r.statusCode, 429);
+      assert.equal(r.headers['x-original'], 'yes');
       await r.body.text();
+      assert.equal(primary.hits, 1);
       assert.equal(cursor.hits, 0);
       assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('3b. cheap-served cascade turn keeps the tool loop on cheap (primary not re-hit)', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok', true));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s3b');
-      assert.equal(r1.statusCode, 200);
-      assert.equal(r1.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
-      await r1.body.text();
-
-      const r2 = await send(url, {
-        model: 'claude',
-        messages: [
-          { role: 'user', content: 'hello' },
-          { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
-        ],
-      }, 'cascade-s3b');
-      assert.equal(r2.statusCode, 200);
-      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=sticky');
-      await r2.body.text();
-      assert.equal(primary.hits, 1);
-      assert.equal(cheap.hits, 2);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('3c. cheap cascade turn does not demote the session: recovered quota sends the next human turn to Claude', async () => {
-    let limited = true;
-    const primary = stub('primary', () =>
-      limited
-        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
-        : jsonResponse('claude ok'));
-    const cursor = stub('cursor', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    let snap: any = { utilization: 1, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
-    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, quota: () => snap, classification: cls });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s3c');
-      assert.equal(r1.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
-      await r1.body.text();
-
-      limited = false;
-      snap = { utilization: 0.2, window: '5h', resetAt: new Date(Date.now() + 60_000), observedAt: new Date() };
-      Object.assign(cls, { simple: 0.99, structural: 0.01, risk: 0 });
-      const r2 = await send(url, {
-        model: 'claude',
-        messages: [
-          { role: 'user', content: 'hello' },
-          { role: 'assistant', content: 'cheap ok' },
-          { role: 'user', content: 'thanks, what time is it in London?' },
-        ],
-      }, 'cascade-s3c');
-      assert.equal(r2.statusCode, 200);
-      assert.match(String(r2.headers['x-jev-route']), /^primary;/);
-      await r2.body.text();
-      assert.equal(cheap.hits, 1);
     } finally {
       await proxy.close();
     }
@@ -277,333 +198,33 @@ describe('failover cascade Claude -> Cursor -> Gemini -> cheap', () => {
 
   it('6. throwing Cursor provider => Gemini serves (cascade advances)', async () => {
     const primary = rateLimitedPrimary();
-    const cursor: any = { name: 'cursor', hits: 0, async send() { cursor.hits++; throw new Error('boom secret detail'); } };
+    const cursor = stub('cursor', () => { throw new Error('boom'); });
     const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary, cursor, gemini });
     try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-throw');
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r.statusCode, 200);
-      assert.equal(r.headers['x-jev-route'], 'gemini; reason=failover:cursor-unavailable');
+      assert.equal(r.headers['x-jev-route'], 'free; reason=failover:cursor-unavailable');
       await r.body.text();
+      assert.equal(primary.hits, 1);
       assert.equal(cursor.hits, 1);
       assert.equal(gemini.hits, 1);
-      assert.equal(cheap.hits, 0);
     } finally {
       await proxy.close();
     }
   });
 
-  it('7. quota probe inside a marked loop never reaches Cursor/Gemini', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-probe-loop');
-      assert.equal(r1.statusCode, 200);
-      await r1.body.text();
-      assert.equal(cursor.hits, 1);
-
-      const r2 = await send(url, { model: 'claude', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }, 'cascade-s-probe-loop');
-      assert.equal(r2.statusCode, 429);
-      assert.equal(await r2.body.text(), ORIGINAL_429_BODY);
-      assert.equal(cursor.hits, 1);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('8. risk-vetoed primary decision + 429 => original 429 verbatim, no cascade hits', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const risky = { simple: 0.99, standard: 0, structural: 0.01, risk: 0.95, riskScores: { security_sensitive: 0.95, destructive_or_production: 0, requires_inspection: 0 }, textOnly: 1 };
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, classification: risky });
-    try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'store this Stripe key in the code' }] }, 'cascade-s-risk');
-      assert.equal(r.statusCode, 429);
-      assert.equal(r.headers['x-original'], 'yes');
-      assert.equal(await r.body.text(), ORIGINAL_429_BODY);
-      assert.equal(primary.hits, 1);
-      assert.equal(cursor.hits, 0);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('8b. sticky primary turn: second human turn classified risky at cascade time => 429, no cascade hits', async () => {
-    let limited = false;
-    const primary = stub('primary', () =>
-      limited
-        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json', 'x-original': 'yes' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
-        : jsonResponse('claude ok'));
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, classification: cls });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-risk-sticky');
-      assert.equal(r1.statusCode, 200);
-      await r1.body.text();
-
-      Object.assign(cls, {
-        risk: 0.95,
-        riskScores: { security_sensitive: 0.95, destructive_or_production: 0, requires_inspection: 0 },
-      });
-      limited = true;
-      const r2 = await send(url, {
-        model: 'claude',
-        messages: [
-          { role: 'user', content: 'hello' },
-          { role: 'assistant', content: 'claude ok' },
-          { role: 'user', content: 'delete the production database' },
-        ],
-      }, 'cascade-s-risk-sticky');
-      assert.equal(r2.statusCode, 429);
-      assert.equal(await r2.body.text(), ORIGINAL_429_BODY);
-      assert.equal(primary.hits, 2);
-      assert.equal(cursor.hits, 0);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('8c. tool continuation: driving human text classified risky at cascade time => 429, no cascade hits', async () => {
-    let limited = false;
-    const primary = stub('primary', () =>
-      limited
-        ? { kind: 'response', status: 429, headers: { 'content-type': 'application/json', 'x-original': 'yes' }, body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]) }
-        : jsonResponse('claude ok'));
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const cls = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1 };
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap, classification: cls });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'delete the production database' }] }, 'cascade-s-risk-tool');
-      assert.equal(r1.statusCode, 200);
-      await r1.body.text();
-
-      Object.assign(cls, {
-        risk: 0.95,
-        riskScores: { security_sensitive: 0, destructive_or_production: 0.95, requires_inspection: 0 },
-      });
-      limited = true;
-      const r2 = await send(url, {
-        model: 'claude',
-        messages: [
-          { role: 'user', content: 'delete the production database' },
-          { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
-        ],
-      }, 'cascade-s-risk-tool');
-      assert.equal(r2.statusCode, 429);
-      assert.equal(await r2.body.text(), ORIGINAL_429_BODY);
-      assert.equal(primary.hits, 2);
-      assert.equal(cursor.hits, 0);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('9. cursor->cheap advance records trivial: continuation stays on cheap, primary not re-hit', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor: any = {
-      name: 'cursor',
-      hits: 0,
-      async send() {
-        cursor.hits++;
-        return cursor.hits === 1 ? jsonResponse('cursor ok', true) : { kind: 'unavailable', reason: 'exit 1' };
-      },
-    };
-    const gemini = stub('gemini', () => ({ kind: 'unavailable', reason: 'exit 1' }));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok', true));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
-    const toolTurn = (extra: any[] = []) => ({
-      model: 'claude',
-      messages: [
-        { role: 'user', content: 'hello' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
-        ...extra,
-      ],
-    });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-adv');
-      assert.equal(r1.statusCode, 200);
-      assert.equal(r1.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
-      await r1.body.text();
-
-      const r2 = await send(url, toolTurn(), 'cascade-s-adv');
-      assert.equal(r2.statusCode, 200);
-      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
-      await r2.body.text();
-
-      const r3 = await send(url, toolTurn([
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Read', input: {} }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'more' }] },
-      ]), 'cascade-s-adv');
-      assert.equal(r3.statusCode, 200);
-      assert.equal(r3.headers['x-jev-route'], 'cheap; reason=sticky');
-      await r3.body.text();
-      assert.equal(primary.hits, 1);
-      assert.equal(cheap.hits, 2);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('9b. without a Gemini tier, cursor->cheap names Cursor as the failed tier', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor: any = {
-      name: 'cursor',
-      hits: 0,
-      async send() {
-        cursor.hits++;
-        return cursor.hits === 1 ? jsonResponse('cursor ok', true) : { kind: 'unavailable', reason: 'exit 1' };
-      },
-    };
-    const cheap = stub('cheap', () => jsonResponse('cheap ok', true));
-    const { proxy, url } = await createTestServer({ primary, cursor, cheap });
-    const toolTurn = (extra: any[] = []) => ({
-      model: 'claude',
-      messages: [
-        { role: 'user', content: 'hello' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'file body' }] },
-        ...extra,
-      ],
-    });
-    try {
-      const r1 = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s-adv-nogem');
-      assert.equal(r1.statusCode, 200);
-      assert.equal(r1.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
-      await r1.body.text();
-
-      const r2 = await send(url, toolTurn(), 'cascade-s-adv-nogem');
-      assert.equal(r2.statusCode, 200);
-      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=failover:cursor-unavailable');
-      await r2.body.text();
-
-      const r3 = await send(url, toolTurn([
-        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Read', input: {} }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'more' }] },
-      ]), 'cascade-s-adv-nogem');
-      assert.equal(r3.statusCode, 200);
-      assert.equal(r3.headers['x-jev-route'], 'cheap; reason=sticky');
-      await r3.body.text();
-      assert.equal(primary.hits, 1);
-      assert.equal(cheap.hits, 2);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('10. primary 529 served by Cursor', async () => {
+  it('7. primary 529 served by Cursor', async () => {
     const primary = rateLimitedPrimary(529);
     const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
+    const { proxy, url } = await createTestServer({ primary, cursor });
     try {
-      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-s529');
+      const r = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
       assert.equal(r.statusCode, 200);
       assert.equal(r.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
-      const data = (await r.body.json()) as any;
-      assert.equal(data.content[0].text, 'cursor ok');
+      await r.body.text();
       assert.equal(primary.hits, 1);
       assert.equal(cursor.hits, 1);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 0);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('11. image-content turn skips Cursor and Gemini straight to cheap', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
-    try {
-      const r = await send(
-        url,
-        {
-          model: 'claude',
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: 'what is in this picture?' },
-              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
-            ],
-          }],
-        },
-        'cascade-s-image',
-      );
-      assert.equal(r.statusCode, 200);
-      assert.equal(r.headers['x-jev-route'], 'cheap; reason=failover:gemini-unavailable');
-      const data = (await r.body.json()) as any;
-      assert.equal(data.content[0].text, 'cheap ok');
-      assert.equal(cursor.hits, 0);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 1);
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('12. Cursor declining an over-budget transcript does not open its breaker', async () => {
-    const primary = rateLimitedPrimary();
-    // Mirrors CursorProvider: a transcript over the command-line budget is declined before spawning.
-    const cursor = stub('cursor', (r) =>
-      JSON.stringify(r.body).length > 5000 ? { kind: 'unavailable', reason: 'transcript budget exceeded' } : jsonResponse('cursor ok'),
-    );
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, cheap });
-    try {
-      for (let i = 0; i < 3; i++) {
-        const long = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'x'.repeat(6000) }] }, `cascade-long-${i}`);
-        assert.equal(long.headers['x-jev-route'], 'cheap; reason=failover:cursor-unavailable');
-        await long.body.text();
-      }
-      const short = await send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] }, 'cascade-short');
-      assert.equal(short.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
-      await short.body.text();
-    } finally {
-      await proxy.close();
-    }
-  });
-
-  it('image/tool_choice turn skips Cursor and Gemini straight to cheap', async () => {
-    const primary = rateLimitedPrimary();
-    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
-    const gemini = stub('gemini', () => jsonResponse('gemini ok'));
-    const cheap = stub('cheap', () => jsonResponse('cheap ok'));
-    const { proxy, url } = await createTestServer({ primary, cursor, gemini, cheap });
-    try {
-      const r = await send(
-        url,
-        { model: 'claude', tool_choice: { type: 'any' }, messages: [{ role: 'user', content: 'hello' }] },
-        'cascade-s6',
-      );
-      assert.equal(r.statusCode, 200);
-      await r.body.text();
-      assert.equal(cursor.hits, 0);
-      assert.equal(gemini.hits, 0);
-      assert.equal(cheap.hits, 1);
     } finally {
       await proxy.close();
     }

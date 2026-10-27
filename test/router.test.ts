@@ -22,13 +22,12 @@ class ScriptedClassifier implements ComplexityClassifier {
   }
 }
 
-function setup(script: () => ComplexityDistribution | Error, { standard = false } = {}) {
+function setup(script: () => ComplexityDistribution | Error, { argon = true } = {}) {
   const classifier = new ScriptedClassifier(script);
   const router = new Router(classifier, new TtlLruStore<Tier>(100, 60_000), {
-    policy: { minCheapProbability: 0.8, standardRoute: 'primary', standardEnabled: standard, minStandardProbability: 0.75 },
+    policy: { minCheapProbability: 0.8, argonEnabled: argon },
     primaryClasses: new Set(['auxiliary', 'compaction']),
     cheapContextTokens: 100_000,
-    standardContextTokens: 250_000,
     classifierTimeoutMs: 1_000,
     classifierMaxChars: 4_000,
   });
@@ -55,6 +54,8 @@ function ctx(messages: unknown[], overrides: Partial<RequestContext> = {}): Requ
   };
 }
 
+const body = (messages: unknown[]) => MessagesBody.parse({ model: 'claude-opus-5-5', messages });
+
 /**
  * First turn as Claude Code 2.1.289 actually sends it (captured, trimmed): context
  * reminders, then the typed prompt, then SessionStart hook output as an inline
@@ -79,16 +80,16 @@ const realFirstTurn = [
 const hookOutput = { role: 'system', content: [{ type: 'text', text: 'UserPromptSubmit hook success' }] };
 
 describe('Router (multi-provider)', () => {
-  it('routes a simple fresh conversation to the cheap provider', async () => {
+  it('routes a simple fresh conversation to the free tier', async () => {
     const { router } = setup(() => SIMPLE);
     const d = await router.decide(ctx([user('explain this hook')]));
-    assert.deepEqual([d.route, d.reason], ['cheap', 'classified']);
+    assert.deepEqual([d.route, d.reason], ['free', 'free:flash']);
   });
 
   it('classifies a real first turn whose hook output trails as a system message', async () => {
     const { router, classifier } = setup(() => SIMPLE);
     const d = await router.decide(ctx(realFirstTurn));
-    assert.deepEqual([d.route, d.reason], ['cheap', 'classified']);
+    assert.deepEqual([d.route, d.reason], ['free', 'free:flash']);
     assert.equal(classifier.calls[0]?.text, 'explain this hook');
   });
 
@@ -99,8 +100,14 @@ describe('Router (multi-provider)', () => {
     assert.equal(classifier.calls[1]?.text, 'now rename it');
   });
 
-  it('routes structural work to the primary', async () => {
+  it('routes structural work to the argon tier', async () => {
     const { router } = setup(() => STRUCTURAL);
+    const d = await router.decide(ctx([user('refactor to clean architecture')]));
+    assert.deepEqual([d.route, d.reason], ['argon', 'argon:high']);
+  });
+
+  it('routes structural work to primary when argon is disabled', async () => {
+    const { router } = setup(() => STRUCTURAL, { argon: false });
     const d = await router.decide(ctx([user('refactor to clean architecture')]));
     assert.deepEqual([d.route, d.reason], ['primary', 'classified']);
   });
@@ -109,20 +116,20 @@ describe('Router (multi-provider)', () => {
     const { router, classifier } = setup(() => SIMPLE);
     await router.decide(ctx([user('rename x')]));
     const d = await router.decide(ctx([user('rename x'), assistantToolUse, toolResult]));
-    assert.deepEqual([d.route, d.reason], ['cheap', 'sticky']);
+    assert.deepEqual([d.route, d.reason], ['free', 'sticky']);
     assert.equal(classifier.calls.length, 1);
   });
 
-  it('escalates a cheap conversation on a structural turn, then stays primary without asking JEV', async () => {
+  it('escalates a free conversation on a structural turn, then stays on escalated route without asking JEV', async () => {
     const scripts = [SIMPLE, STRUCTURAL];
     const { router, classifier } = setup(() => scripts.shift()!);
     await router.decide(ctx([user('rename x')]));
 
     const up = await router.decide(ctx([user('rename x'), assistantText, user('now redesign the layers')]));
-    assert.deepEqual([up.route, up.reason], ['primary', 'escalated']);
+    assert.deepEqual([up.route, up.reason], ['argon', 'argon:high']);
 
-    const stay = await router.decide(ctx([user('rename x'), assistantText, user('a'), assistantText, user('rename y')]));
-    assert.deepEqual([stay.route, stay.reason], ['primary', 'sticky']);
+    const stay = await router.decide(ctx([user('rename x'), assistantText, user('now redesign the layers'), assistantToolUse, toolResult]));
+    assert.deepEqual([stay.route, stay.reason], ['argon', 'sticky']);
     assert.equal(classifier.calls.length, 2);
   });
 
@@ -132,10 +139,10 @@ describe('Router (multi-provider)', () => {
     assert.deepEqual([d.route, d.reason], ['primary', 'passthrough:classifier-failed']);
   });
 
-  it('escalates a cheap conversation when JEV fails on a new human turn', async () => {
+  it('escalates a free conversation when JEV fails on a new human turn', async () => {
     let script: () => ComplexityDistribution | Error = () => SIMPLE;
     const { router } = setup(() => script());
-    assert.equal((await router.decide(ctx([user('fix the typo')]))).route, 'cheap');
+    assert.equal((await router.decide(ctx([user('fix the typo')]))).route, 'free');
 
     script = () => new Error('timeout');
     const d = await router.decide(ctx([user('fix the typo'), assistantText, user('now redesign the module')]));
@@ -158,7 +165,7 @@ describe('Router (multi-provider)', () => {
     assert.deepEqual([d.route, d.reason], ['primary', 'sticky']);
   });
 
-  it('escalates when the conversation outgrows the cheap context budget', async () => {
+  it('escalates when the conversation outgrows context budget', async () => {
     const { router } = setup(() => SIMPLE);
     await router.decide(ctx([user('small')]));
     const d = await router.decide(ctx([user('small'), assistantToolUse, toolResult], { rawByteLength: 600_000 }));
@@ -170,48 +177,15 @@ describe('Router (multi-provider)', () => {
     const { router } = setup(() => scripts.shift()!);
     await router.decide(ctx([user('architect it')]));
     const sub = await router.decide(ctx([user('grep for foo')], { agentId: 'agent-1', requestClass: 'subagent' }));
-    assert.equal(sub.route, 'cheap');
+    assert.equal(sub.route, 'free');
   });
 
-  it('pinToPrimary moves a cheap conversation to the primary for good', async () => {
+  it('pinToPrimary moves a conversation to the primary for good', async () => {
     const { router } = setup(() => SIMPLE);
     const d = await router.decide(ctx([user('rename x')]));
     router.pinToPrimary(d);
     const next = await router.decide(ctx([user('rename x'), assistantToolUse, toolResult]));
     assert.equal(next.route, 'primary');
-  });
-
-  it('sends level-2 work to the standard tier on the cheap route, and only ever moves the tier up', async () => {
-    const scripts = [SIMPLE, STANDARD, SIMPLE, STRUCTURAL];
-    const { router } = setup(() => scripts.shift()!, { standard: true });
-    const first = await router.decide(ctx([user('rename x')]));
-    assert.deepEqual([first.route, first.tier, first.reason], ['cheap', 'trivial', 'classified']);
-
-    const t2 = [user('rename x'), assistantText, user('now add pagination to the list')];
-    const up = await router.decide(ctx(t2));
-    assert.deepEqual([up.route, up.tier, up.reason], ['cheap', 'standard', 'escalated:standard']);
-
-    const t3 = [...t2, assistantText, user('fix the typo')];
-    const stay = await router.decide(ctx(t3));
-    assert.deepEqual([stay.route, stay.tier, stay.reason], ['cheap', 'standard', 'sticky'], 'never back down to trivial');
-
-    const top = await router.decide(ctx([...t3, assistantText, user('redesign the layers')]));
-    assert.deepEqual([top.route, top.tier, top.reason], ['primary', 'primary', 'escalated']);
-  });
-
-  it('never picks the standard tier when it is off', async () => {
-    const { router } = setup(() => STANDARD);
-    const d = await router.decide(ctx([user('add pagination')]));
-    assert.deepEqual([d.route, d.tier], ['primary', 'primary']);
-  });
-
-  it('gives the standard tier its own context budget', async () => {
-    const { router } = setup(() => STANDARD, { standard: true });
-    await router.decide(ctx([user('add pagination')]));
-    const fits = await router.decide(ctx([user('add pagination'), assistantToolUse, toolResult], { rawByteLength: 600_000 }));
-    assert.deepEqual([fits.route, fits.tier], ['cheap', 'standard'], '~200k tokens: over trivial, under standard');
-    const over = await router.decide(ctx([user('add pagination'), assistantToolUse, toolResult], { rawByteLength: 1_000_000 }));
-    assert.deepEqual([over.route, over.reason], ['primary', 'escalated:context']);
   });
 
   it('strips system-reminders before classifying', async () => {
@@ -222,19 +196,19 @@ describe('Router (multi-provider)', () => {
 });
 
 describe('Router under quota pressure', () => {
-  /** P(simple) 0.75: below the normal 0.8 bar, above the 0.7 pressure bar. */
-  const BORDERLINE: ComplexityDistribution = { simple: 0.75, standard: 0.2, structural: 0.05 };
+  /** P(simple) 0.75, standard 0.05, structural 0.2: below the 0.8 bar. */
+  const BORDERLINE: ComplexityDistribution = { simple: 0.75, standard: 0.05, structural: 0.2 };
   const RISKY = { ...SIMPLE, risk: 0.9 };
 
   function quotaSetup(script: () => ComplexityDistribution | Error, quota: { level: QuotaLevel } | undefined) {
     const classifier = new ScriptedClassifier(script);
     const router = new Router(classifier, new TtlLruStore<Tier>(100, 60_000), {
-      policy: { minCheapProbability: 0.8, standardRoute: 'primary' },
+      policy: { minCheapProbability: 0.8, minStandardProbability: 0.9, argonEnabled: false },
       primaryClasses: new Set(['auxiliary', 'compaction']),
       cheapContextTokens: 100_000,
       classifierTimeoutMs: 1_000,
       classifierMaxChars: 4_000,
-      ...(quota ? { quota: { level: () => quota.level }, pressurePolicy: { minCheapProbability: 0.7, minStandardProbability: 0.6 } } : {}),
+      ...(quota ? { quota: { level: () => quota.level }, pressurePolicy: { minCheapProbability: 0.7, minStandardProbability: 0.8 } } : {}),
     });
     return { classifier, router };
   }
@@ -245,7 +219,7 @@ describe('Router under quota pressure', () => {
     assert.equal((await router.decide(ctx([user('rename x')], { sessionId: 'A' }))).route, 'primary');
     quota.level = 'pressure';
     const d = await router.decide(ctx([user('rename x')], { sessionId: 'B' }));
-    assert.deepEqual([d.route, d.reason], ['cheap', 'quota:pressure']);
+    assert.deepEqual([d.route, d.reason], ['free', 'quota:pressure']);
   });
 
   it('keeps auxiliary traffic on Claude even when critical', async () => {
@@ -254,7 +228,7 @@ describe('Router under quota pressure', () => {
     assert.deepEqual([d.route, d.reason], ['primary', 'passthrough:request-class']);
   });
 
-  it('when critical, re-classifies a new human turn of a Claude-pinned session and keeps it cheap after', async () => {
+  it('when critical, re-classifies a new human turn of a Claude-pinned session and keeps it free after', async () => {
     const scripts = [STRUCTURAL, SIMPLE];
     const quota = { level: 'none' as QuotaLevel };
     const { router, classifier } = quotaSetup(() => scripts.shift()!, quota);
@@ -263,11 +237,11 @@ describe('Router under quota pressure', () => {
     quota.level = 'critical';
     const t2 = [user('redesign the layers'), assistantText, user('now rename x')];
     const down = await router.decide(ctx(t2));
-    assert.deepEqual([down.route, down.reason], ['cheap', 'quota:reclassified']);
+    assert.deepEqual([down.route, down.reason], ['free', 'quota:reclassified']);
 
     quota.level = 'none';
     const loop = await router.decide(ctx([...t2, assistantToolUse, toolResult]));
-    assert.deepEqual([loop.route, loop.reason], ['cheap', 'sticky'], 'going back would rebuild the Claude cache');
+    assert.deepEqual([loop.route, loop.reason], ['free', 'sticky'], 'going back would rebuild the Claude cache');
     assert.equal(classifier.calls.length, 2);
   });
 
@@ -292,7 +266,7 @@ describe('Router under quota pressure', () => {
     const { router } = quotaSetup(() => scripts.shift()!, { level: 'critical' });
     await router.decide(ctx([user('redesign the layers')], { sessionId: 'C-crit' }));
     const d = await router.decide(ctx([user('<summary of the session>')], { sessionId: 'C-crit', contextCompacted: true }));
-    assert.deepEqual([d.route, d.reason], ['cheap', 'quota:reclassified']);
+    assert.deepEqual([d.route, d.reason], ['free', 'quota:reclassified']);
   });
 
   it('behaves as before without quota routing (QUOTA_ROUTING=false)', async () => {
@@ -302,65 +276,50 @@ describe('Router under quota pressure', () => {
 });
 
 describe('lastHumanText', () => {
-  const body = (messages: unknown[]) => MessagesBody.parse({ model: 'claude-opus-5-5', messages });
-
   it('returns the most recent human text', () => {
     assert.equal(lastHumanText(body([user('first'), assistantText, user('second')])), 'second');
   });
 
   it('falls back to the human request driving a tool loop', () => {
-    assert.equal(
-      lastHumanText(body([user('delete the production database'), assistantToolUse, toolResult])),
-      'delete the production database',
-    );
+    assert.equal(lastHumanText(body([user('first'), assistantToolUse, toolResult])), 'first');
   });
 
   it('skips a trailing user turn with no human text', () => {
-    assert.equal(lastHumanText(body([user('do X'), assistantText, user('<system-reminder>only</system-reminder>')])), 'do X');
+    assert.equal(lastHumanText(body([user('first'), assistantToolUse, toolResult, assistantToolUse, toolResult])), 'first');
   });
 
   it('returns undefined when there is no human text', () => {
-    assert.equal(lastHumanText(body([assistantText, toolResult])), undefined);
+    assert.equal(lastHumanText(body([assistantText])), undefined);
+    assert.equal(lastHumanText(body([assistantToolUse, toolResult])), undefined);
   });
 });
 
 describe('Router.cascadeRiskVeto', () => {
-  const body = (messages: unknown[]) => MessagesBody.parse({ model: 'claude-opus-5-5', messages });
-  const RISKY_CLS = {
-    ...STRUCTURAL,
-    risk: 0.95,
-    riskScores: { security_sensitive: 0.95, destructive_or_production: 0, requires_inspection: 0 },
-  };
-  const BENIGN_CLS = { ...STRUCTURAL, risk: 0.1 };
-
   it('vetoes when the classifier scores the last human text risky', async () => {
-    const { router, classifier } = setup(() => RISKY_CLS);
-    assert.equal(await router.cascadeRiskVeto(body([user('delete the production database')])), true);
-    assert.equal(classifier.calls[0]?.text, 'delete the production database');
+    const { router } = setup(() => ({ ...SIMPLE, risk: 0.9 }));
+    assert.equal(await router.cascadeRiskVeto(body([user('run this dangerous command')])), true);
   });
 
   it('does not veto a benign turn', async () => {
-    const { router } = setup(() => BENIGN_CLS);
-    assert.equal(await router.cascadeRiskVeto(body([user('rename x')])), false);
+    const { router } = setup(() => ({ ...SIMPLE, risk: 0.1 }));
+    assert.equal(await router.cascadeRiskVeto(body([user('fix the typo')])), false);
   });
 
   it('classifies the driving human text of a tool continuation', async () => {
-    const { router, classifier } = setup(() => RISKY_CLS);
-    assert.equal(
-      await router.cascadeRiskVeto(body([user('put the Stripe key in the code'), assistantToolUse, toolResult])),
-      true,
-    );
-    assert.equal(classifier.calls[0]?.text, 'put the Stripe key in the code');
+    const { router, classifier } = setup(() => ({ ...SIMPLE, risk: 0.85 }));
+    const veto = await router.cascadeRiskVeto(body([user('inspect the prod db'), assistantToolUse, toolResult]));
+    assert.equal(veto, true);
+    assert.equal(classifier.calls[0]?.text, 'inspect the prod db');
   });
 
   it('returns false without classifying when there is no human text', async () => {
-    const { router, classifier } = setup(() => RISKY_CLS);
-    assert.equal(await router.cascadeRiskVeto(body([assistantText, toolResult])), false);
+    const { router, classifier } = setup(() => SIMPLE);
+    assert.equal(await router.cascadeRiskVeto(body([assistantText])), false);
     assert.equal(classifier.calls.length, 0);
   });
 
   it('counts classifier failure as risky (fail toward primary)', async () => {
-    const { router } = setup(() => new Error('timeout'));
+    const { router } = setup(() => new Error('jev down'));
     assert.equal(await router.cascadeRiskVeto(body([user('anything')])), true);
   });
 });

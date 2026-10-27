@@ -9,7 +9,6 @@ import { HeuristicClassifier } from '../src/classifier/heuristic-classifier.js';
 import { loadConfig } from '../src/config.js';
 import type { Tier } from '../src/domain/policy.js';
 import { AnthropicProvider } from '../src/providers/anthropic.js';
-import { OpenAICompatibleProvider } from '../src/providers/openai/provider.js';
 import { buildServer } from '../src/proxy/server.js';
 import { QuotaStore, type QuotaSnapshot } from '../src/quota.js';
 import { Router } from '../src/routing/router.js';
@@ -47,20 +46,18 @@ describe('quota capture (proxy)', () => {
     const config = loadConfig({
       CLASSIFIER: 'heuristic',
       ANTHROPIC_UPSTREAM_URL: `http://127.0.0.1:${(anthropic.address() as AddressInfo).port}`,
-      CHEAP_API_KEY: 'k',
       LOG_LEVEL: 'fatal',
     });
     const router = new Router(new HeuristicClassifier(), new TtlLruStore<Tier>(100, 60_000), {
-      policy: { minCheapProbability: 0.99, standardRoute: 'primary' },
+      policy: { minCheapProbability: config.router.minCheapProbability },
       primaryClasses: config.router.primaryClasses,
-      cheapContextTokens: 100_000,
       classifierTimeoutMs: 1_000,
       classifierMaxChars: 4_000,
     });
     proxy = buildServer({
       config,
       router,
-      providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap) },
+      providers: { primary: new AnthropicProvider(config.primary) },
       telemetry,
       quota,
     });

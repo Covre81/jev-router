@@ -26,7 +26,7 @@ describe('auditFailure', () => {
     };
     auditFailure(sink, { route: 'cheap', reason: 'classified', conversationKey: 'k' }, ctx, 'network: ECONNREFUSED');
     // Failed over to Claude, which failed too: the cheap retry's record is not this attempt's cause.
-    auditFailure(sink, { route: 'primary', reason: 'failover:cheap-unavailable', conversationKey: 'k' }, ctx, 'network: getaddrinfo ENOTFOUND');
+    auditFailure(sink, { route: 'primary', reason: 'failover:gemini-unavailable', conversationKey: 'k' }, ctx, 'network: getaddrinfo ENOTFOUND');
     auditFailure(sink, { route: 'primary', reason: 'sticky', conversationKey: 'k' }, { ...ctx, upstream: undefined }, `HTTP 500: ${'x'.repeat(500)}`);
     assert.deepEqual(rows.map((r) => r.upstreamFailure?.slice(0, 32)), ['retried: network', 'network: getaddrinfo ENOTFOUND', 'HTTP 500: ' + 'x'.repeat(22)]);
     assert.equal(rows[2]!.upstreamFailure!.length, 200);
