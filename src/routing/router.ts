@@ -9,6 +9,7 @@ import {
   isCodingTurn,
   selectArgonProfile,
   primaryProfile,
+  raiseToFloor,
   type EscalationReason,
   type PolicyOptions,
   type PrimaryProfile,
@@ -60,7 +61,8 @@ export type RouteReason =
   | 'hop-timeout:flash'
   | 'hop-timeout:argon'
   | 'hop-timeout:cursor'
-  | 'hop-timeout:claude';
+  | 'hop-timeout:claude'
+  | `quota-substitute:${string}`;
 
 export interface RouteDecision {
   readonly route: Route;
@@ -81,6 +83,7 @@ export interface RouteDecision {
   readonly profileScore?: Classification;
   readonly escalationReason?: EscalationReason;
   readonly argonProfile?: ArgonProfile;
+  readonly substitutedFrom?: string;
 }
 
 /** Facts about the request that live outside the body (Claude Code headers). */
@@ -206,6 +209,7 @@ export class Router {
     dec: RouteDecision,
     ctxOrDistribution: RequestContext | MessagesBody | Classification | undefined,
     reason: EscalationReason,
+    floor?: PrimaryProfile,
   ): Promise<RouteDecision> {
     if (!this.options.primaryProfiles) return dec;
     const key = dec.conversationKey;
@@ -224,7 +228,8 @@ export class Router {
 
     const stored = dec.primaryProfile ?? this.profiles.get(key);
     if (stored) {
-      return { ...dec, primaryProfile: stored, escalationReason: reason };
+      const finalProfile = floor ? raiseToFloor(stored, floor) : stored;
+      return { ...dec, primaryProfile: finalProfile, escalationReason: reason };
     }
 
     let distribution: Classification | undefined = dec.distribution;
@@ -243,9 +248,17 @@ export class Router {
       }
     }
 
-    if (!distribution) return dec;
+    if (!distribution) {
+      if (floor) {
+        return { ...dec, primaryProfile: floor, escalationReason: reason };
+      }
+      return dec;
+    }
 
-    const profile = primaryProfile(distribution, reason);
+    let profile = primaryProfile(distribution, reason);
+    if (floor) {
+      profile = raiseToFloor(profile, floor);
+    }
     if (reason !== 'gemini-busy') {
       this.profiles.set(key, profile);
     }

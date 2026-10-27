@@ -27,7 +27,7 @@ export interface ProviderRequest {
  */
 export type ProviderResult =
   | { readonly kind: 'response'; readonly status: number; readonly headers: HeaderMap; readonly body: Readable }
-  | { readonly kind: 'unavailable'; readonly reason: string };
+  | { readonly kind: 'unavailable'; readonly reason: string; readonly quota?: { readonly resetAt: number } | undefined };
 
 export interface Provider {
   readonly name: string;

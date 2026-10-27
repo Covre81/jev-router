@@ -4,6 +4,7 @@ import { existsSync, readdirSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parseQuotaError } from '../quota-state.js';
 
 export interface CursorRunnerOptions {
   /** Cursor agent root: `%LOCALAPPDATA%\cursor-agent` (holds `versions\<date>\node.exe` + `index.js`). */
@@ -17,7 +18,7 @@ export interface CursorRunnerOptions {
 
 export type CursorResult =
   | { readonly ok: true; readonly text: string; readonly usage: { readonly inputTokens: number; readonly outputTokens: number } }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: string; readonly quota?: { readonly resetAt: number } | undefined };
 
 export type SpawnCursor = (bin: string, args: string[], options: any) => ChildProcess;
 
@@ -65,6 +66,11 @@ function toolKind(ev: any): string {
 
 const isToolStarted = (ev: any): boolean =>
   ev?.type === 'tool_call' && ev?.subtype !== 'completed' && ev?.status !== 'completed';
+
+function stderrTail(s: string): string {
+  const trimmed = s.trim().replace(/\s+/g, ' ');
+  return trimmed.slice(-300);
+}
 
 export async function runCursorAgent(
   prompt: string,
@@ -137,12 +143,13 @@ export async function runCursorAgent(
         settle({ ok: false, reason: 'aborted' });
       };
 
-      const firstByteTimeoutMs = opts.firstByteTimeoutMs ?? 60_000;
+      const firstByteTimeoutMs = opts.firstByteTimeoutMs ?? 90_000;
       const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
 
       firstByteTimer = setTimeout(() => {
         if (child.pid !== undefined) killTree(child.pid);
-        settle({ ok: false, reason: 'first-byte-timeout' });
+        const detail = stderrTail(stderrText);
+        settle({ ok: false, reason: detail ? `first-byte-timeout: ${detail}` : 'first-byte-timeout' });
       }, firstByteTimeoutMs);
 
       overallTimer = setTimeout(() => {
@@ -184,7 +191,8 @@ export async function runCursorAgent(
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
           if (child.pid !== undefined) killTree(child.pid);
-          settle({ ok: false, reason: 'idle-timeout' });
+          const detail = stderrTail(stderrText);
+          settle({ ok: false, reason: detail ? `idle-timeout: ${detail}` : 'idle-timeout' });
         }, idleTimeoutMs);
 
         stdoutBuffer += chunk.toString('utf8');
@@ -196,7 +204,7 @@ export async function runCursorAgent(
         }
       });
       child.stderr!.on('data', (chunk) => {
-        stderrText = (stderrText + chunk.toString('utf8')).slice(0, 500);
+        stderrText = (stderrText + chunk.toString('utf8')).slice(-1000);
       });
       child.on('error', (err) => settle({ ok: false, reason: `spawn failed: ${err.message}` }));
       child.on('close', (code) => {
@@ -206,20 +214,27 @@ export async function runCursorAgent(
         if (toolAttempted) return settle({ ok: false, reason: `tool attempt: ${toolAttempted}` });
         if (opts.signal?.aborted) return settle({ ok: false, reason: 'aborted' });
         if (code !== 0) {
-          const detail = stderrText.trim().replace(/\s+/g, ' ');
+          const detail = stderrTail(stderrText);
+          const errCandidate = [stderrText, detail].filter(Boolean).join(' ');
+          const quotaParsed = parseQuotaError(errCandidate);
+          if (quotaParsed) {
+            return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+          }
           return settle({ ok: false, reason: detail ? `exit ${code}: ${detail}` : `exit ${code}` });
         }
         if (!finalResult) return settle({ ok: false, reason: 'no result event' });
         if (finalResult.is_error || finalResult.subtype !== 'success') {
-          const detail = typeof finalResult.result === 'string' && finalResult.result ? `: ${finalResult.result.slice(0, 200)}` : '';
+          const resultStr = typeof finalResult.result === 'string' ? finalResult.result : '';
+          const quotaParsed = parseQuotaError(resultStr || stderrText);
+          if (quotaParsed) {
+            return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+          }
+          const detail = resultStr ? `: ${resultStr.slice(0, 200)}` : '';
           return settle({ ok: false, reason: `result error${detail}` });
         }
         const text = (typeof finalResult.result === 'string' && finalResult.result.trim() ? finalResult.result : segmentText || aggregateText).trim();
         if (!text) return settle({ ok: false, reason: 'empty' });
-        const lower = text.toLowerCase();
-        if (lower.includes('usage limit') || lower.includes('quota') || lower.includes('upgrade')) {
-          return settle({ ok: false, reason: `quota: ${text.slice(0, 100)}` });
-        }
+
         settle({
           ok: true,
           text,

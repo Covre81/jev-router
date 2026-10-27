@@ -38,7 +38,7 @@ export class CursorCliProvider implements Provider {
       signal: req.signal,
     };
     const res = await runCursorAgent(prompt, runnerOpts, this.opts.spawnFn);
-    if (!res.ok) return { kind: 'unavailable', reason: res.reason };
+    if (!res.ok) return { kind: 'unavailable', reason: res.reason, ...(res.quota ? { quota: res.quota } : {}) };
     return anthropicResponseFromCliText({ rawText: res.text, usage: res.usage, model: this.opts.model, stream: (req.body as { stream?: unknown }).stream === true });
   }
 }

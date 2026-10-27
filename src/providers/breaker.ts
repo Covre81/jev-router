@@ -3,22 +3,31 @@ export type BreakerState = 'closed' | 'open' | 'half-open';
 export class CircuitBreaker {
   private failures = 0;
   private lastFailureTime = 0;
+  private customCooldownMs?: number | undefined;
   public inFlight = 0;
 
   constructor(
     private readonly maxFailures: number,
     private readonly cooldownMs: number,
-    private readonly maxConcurrency: number
+    private readonly maxConcurrency: number,
+    private readonly clock: () => number = Date.now,
   ) {}
 
   get state(): BreakerState {
     if (this.failures >= this.maxFailures) {
-      if (Date.now() - this.lastFailureTime > this.cooldownMs) {
+      const cooldown = this.customCooldownMs ?? this.cooldownMs;
+      if (this.clock() - this.lastFailureTime > cooldown) {
         return 'half-open';
       }
       return 'open';
     }
     return 'closed';
+  }
+
+  forceOpen(cooldownMs: number): void {
+    this.failures = this.maxFailures;
+    this.lastFailureTime = this.clock();
+    this.customCooldownMs = cooldownMs;
   }
 
   acquire(): boolean {
@@ -35,9 +44,10 @@ export class CircuitBreaker {
     this.inFlight--;
     if (outcome === 'neutral') return;
 
-      if (outcome === 'success') {
+    if (outcome === 'success') {
       this.failures = 0;
       this.lastFailureTime = 0;
+      this.customCooldownMs = undefined;
     } else {
       if (this.failures >= this.maxFailures) {
         // already open/half-open, push/keep open
@@ -45,7 +55,7 @@ export class CircuitBreaker {
       } else {
         this.failures++;
       }
-      this.lastFailureTime = Date.now();
+      this.lastFailureTime = this.clock();
     }
   }
 }

@@ -19,6 +19,7 @@ import { ensureAgyHome } from './providers/gemini/isolation.js';
 import { GeminiCliProvider } from './providers/gemini/provider.js';
 import { CursorCliProvider } from './providers/cursor/provider.js';
 import { CircuitBreaker } from './providers/breaker.js';
+import { ModelQuotaState } from './providers/quota-state.js';
 
 const SESSION_MAX_ENTRIES = 10_000;
 
@@ -130,19 +131,21 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       ? {
           cursor: new CursorCliProvider({
             ...config.cursor,
-            firstByteTimeoutMs: config.timeouts.firstByteMs,
+            firstByteTimeoutMs: config.cursor.firstByteTimeoutMs,
             idleTimeoutMs: config.timeouts.idleMs,
           }),
         }
       : {}),
   };
 
+  const quotaState = new ModelQuotaState();
   const build = runningBuild();
   const app = buildServer({
     config,
     router,
     providers,
     telemetry,
+    quotaState,
     ...(build ? { build } : {}),
     ...(quota ? { quota } : {}),
     ...(geminiBreaker ? { geminiBreaker } : {}),

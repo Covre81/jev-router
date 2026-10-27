@@ -3,6 +3,7 @@ import { killTree } from '../cli-kill.js';
 import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parseQuotaError } from '../quota-state.js';
 
 export interface AgyRunnerOptions {
   readonly bin: string;
@@ -16,7 +17,7 @@ export interface AgyRunnerOptions {
 
 export type AgyResult =
   | { readonly ok: true; readonly text: string; readonly usage: { readonly inputTokens: number; readonly outputTokens: number } }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: string; readonly quota?: { readonly resetAt: number } | undefined };
 
 export type SpawnAgy = (bin: string, args: string[], options: any) => ChildProcess;
 
@@ -65,7 +66,9 @@ export async function runAgy(
     let finalResult: any = undefined;
     let toolAttempted: string | false = false;
     let stdoutBuffer = '';
+    let stderrText = '';
     let textDelta = '';
+    let errorEventText = '';
     let firstByteReceived = false;
 
     return await new Promise<AgyResult>((resolve) => {
@@ -147,9 +150,16 @@ export async function runAgy(
               }
             } else if (ev.event === 'result' && ev.result) {
               finalResult = ev.result;
+            } else if (ev.event === 'error' || ev.event === 'status') {
+              const msg = ev.error ?? ev.message ?? ev.status;
+              if (typeof msg === 'string') errorEventText = (errorEventText + ' ' + msg).slice(-1000);
             }
           } catch {}
         }
+      });
+
+      child.stderr!.on('data', (chunk) => {
+        stderrText = (stderrText + chunk.toString('utf8')).slice(-1000);
       });
 
       child.on('error', (err) => {
@@ -170,6 +180,23 @@ export async function runAgy(
         if (opts.signal?.aborted) {
           return settle({ ok: false, reason: 'aborted' });
         }
+
+        // Quota is read ONLY from genuine error channels (error events, result error on a
+        // non-success run, stderr). Never from the model's answer: a reply about rate
+        // limiters must not be mistaken for an exhausted quota.
+        const succeeded = code === 0 && finalResult?.status === 'SUCCESS';
+        if (!succeeded) {
+          const errCandidate = [
+            errorEventText,
+            finalResult?.status !== 'SUCCESS' ? finalResult?.error : undefined,
+            stderrText,
+          ].filter(Boolean).join(' ');
+          const quotaParsed = parseQuotaError(errCandidate);
+          if (quotaParsed) {
+            return settle({ ok: false, reason: 'quota', quota: { resetAt: quotaParsed.resetAt } });
+          }
+        }
+
         if (code !== 0) {
           const reasonMsg = (finalResult && finalResult.status === 'ERROR' && finalResult.error) ? finalResult.error : '';
           if (finalResult && finalResult.status === 'ERROR') {
@@ -188,7 +215,7 @@ export async function runAgy(
         if (!responseText) {
           return settle({ ok: false, reason: 'empty' });
         }
-        
+
         settle({
           ok: true,
           text: finalResult.response || textDelta,
