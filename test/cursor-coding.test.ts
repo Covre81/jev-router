@@ -380,3 +380,14 @@ describe('Argon tier vs legacy Gemini text-only gate (quota pressure)', () => {
     assert.equal(dec.reason, 'gemini:text-only');
   });
 });
+
+describe('isPromptFileRead (temp-file prompt channel)', async () => {
+  const { isPromptFileRead } = await import('../src/providers/cursor/agent-runner.js');
+  it('allows reading the delivered prompt.md', () => {
+    assert.equal(isPromptFileRead({ type: 'tool_call', subtype: 'started', tool_call: { readToolCall: { args: { path: 'C:/tmp/jev-cursor-x/prompt.md' } } } }), true);
+  });
+  it('rejects reads of other files and non-read tools', () => {
+    assert.equal(isPromptFileRead({ type: 'tool_call', subtype: 'started', tool_call: { readToolCall: { args: { path: 'C:/secret/.env' } } } }), false);
+    assert.equal(isPromptFileRead({ type: 'tool_call', subtype: 'started', tool_call: { shellToolCall: { args: { command: 'cat prompt.md' } } } }), false);
+  });
+});
