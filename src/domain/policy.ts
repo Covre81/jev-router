@@ -68,7 +68,7 @@ export function bumpArgonProfile(profile: ArgonProfile): ArgonProfile | null {
   return null;
 }
 
-export const CURSOR_CODING_MAX_TEXT_ONLY = 0.5;
+export const CURSOR_CODING_MAX_TEXT_ONLY = 0.75;
 export const CURSOR_CODING_MIN_MASS = 0.5;
 
 export function isCodingTurn(

@@ -80,7 +80,7 @@ const Env = z
     CURSOR_TIER_BREAKER_FAILURES: z.coerce.number().int().min(1).default(3),
     CURSOR_TIER_BREAKER_COOLDOWN_MS: z.coerce.number().int().positive().default(300_000),
     CURSOR_CODING: z.enum(['off', 'on']).default('on'),
-    CURSOR_CODING_MAX_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.5),
+    CURSOR_CODING_MAX_TEXT_ONLY: z.coerce.number().min(0).max(1).default(0.75),
     CURSOR_CODING_MIN_MASS: z.coerce.number().min(0).max(1).default(0.5),
     TIER_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     TIER_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
