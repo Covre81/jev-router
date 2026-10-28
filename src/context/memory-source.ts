@@ -103,6 +103,8 @@ export async function searchMemory(options: {
       {
         timeout: options.timeoutMs,
         signal: options.signal,
+        // No console window flash on Windows (hook runs without a console).
+        windowsHide: true,
       }
     );
 
