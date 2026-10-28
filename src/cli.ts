@@ -66,6 +66,7 @@ async function main(argv: string[]): Promise<number> {
         await supervise(config, () =>
           fork(fileURLToPath(import.meta.url), ['serve', ...(envFile ? ['--env', envFile] : [])], {
             env: { ...shellEnv, JEV_ROUTER_WORKER: '1' },
+            windowsHide: true,
             // `tsx watch` / `node --test` flags would make the worker a watcher or a test run.
             execArgv: process.execArgv.filter((a) => !/^--(watch|test)/.test(a)),
           }),
