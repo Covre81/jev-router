@@ -785,9 +785,8 @@ export function buildServer({
     }
 
     if (decision.route === 'free') {
-      const flashRes = hasImageDocumentOrToolChoice(base.body!)
-        ? ({ kind: 'skipped' as const, reason: 'skipped:gemini-unhealthy' as const })
-        : await tryFlash(activeBase);
+      // Flash eligibility (tool_choice, image, document) is decided once, in Router.decideTier.
+      const flashRes = await tryFlash(activeBase);
       if (flashRes.kind === 'response') {
         router.markFallbackLoop(decision, 'free');
         return safeRelay(flashRes.result, decision, exchange('free', config.gemini?.model));

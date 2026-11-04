@@ -151,6 +151,26 @@ describe('Router decisions', () => {
     assert.notEqual(dec2.route, 'free');
   });
 
+  // Regression: a simple turn scored 'free' leaked to the server, which skipped Flash and
+  // logged 'skipped:gemini-unhealthy' — a health failure that never happened.
+  it('simple turn with tool_choice any or image is decided primary by the router', async () => {
+    const simple = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { router, store } = setupRouter(simple);
+    const forced = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }], tool_choice: { type: 'any' } }, { 'x-claude-code-session-id': 's12b' }) as any);
+    assert.equal(forced.route, 'primary');
+    assert.equal(forced.reason, 'gemini:ineligible-input');
+
+    store.set('s13b:main', 'free');
+    const continuation = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1' }, { type: 'image' }] },
+    ];
+    const image = await router.decide(req({ messages: continuation }, { 'x-claude-code-session-id': 's13b' }) as any);
+    assert.equal(image.route, 'primary');
+    assert.equal(image.reason, 'gemini:ineligible-input');
+  });
+
   it('no geminiPolicy + text-only -> primary', async () => {
     const { router } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 }, { noGeminiPolicy: true });
     const dec = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }] }, { 'x-claude-code-session-id': 's14' }) as any);

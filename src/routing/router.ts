@@ -44,6 +44,8 @@ export type RouteReason =
   | 'failover:primary-rate-limited'
   | 'gemini:text-only'
   | 'gemini:text-only:pressure'
+  /** Turn forces a tool (tool_choice any/tool) or carries an image/document: Flash can't serve it. */
+  | 'gemini:ineligible-input'
   | 'skipped:gemini-unhealthy'
   | 'skipped:gemini-busy'
   | 'failover:gemini-unavailable'
@@ -321,7 +323,9 @@ export class Router {
 
     const resolve = (tier: Tier, reason: RouteReason, extra: Partial<RouteDecision> = {}): RouteDecision => {
       const escalatedByContext = inputTokens > (budget[tier] ?? Infinity);
-      const final: Tier = escalatedByContext ? 'primary' : tier;
+      // Single owner of Flash eligibility: the server trusts route 'free' and never re-checks.
+      const ineligibleForFlash = !escalatedByContext && tierRoute(tier) === 'free' && hasImageDocumentOrToolChoice(ctx.body);
+      const final: Tier = escalatedByContext || ineligibleForFlash ? 'primary' : tier;
       this.sessions.set(key, final);
       if (final === 'gemini' || final === 'free') this.lastRouteWasGemini.add(key);
       else this.lastRouteWasGemini.delete(key);
@@ -329,7 +333,7 @@ export class Router {
         ...extra,
         route: tierRoute(final),
         tier: final,
-        reason: escalatedByContext ? 'escalated:context' : reason,
+        reason: escalatedByContext ? 'escalated:context' : ineligibleForFlash ? 'gemini:ineligible-input' : reason,
         conversationKey: key,
       });
     };
