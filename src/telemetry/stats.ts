@@ -49,6 +49,8 @@ export interface RouterStats {
   readonly geminiFallbacks: number;
   readonly geminiSkipped: number;
   readonly cursorFallbacks: number;
+  /** Turns the local Ollama fallback failed (empty answer, timeout…); the cascade served them elsewhere. */
+  readonly cheapLocalFailures: number;
 }
 
 export interface StatsOptions {
@@ -95,6 +97,7 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     geminiFallbacks: number;
     geminiSkipped: number;
     cursorFallbacks: number;
+    cheapLocalFailures: number;
   }>(`
     SELECT count(*) AS total, min(created_at) AS firstAt, max(created_at) AS lastAt,
       coalesce(sum(CASE WHEN jev_decision IS NOT NULL THEN 1 ELSE 0 END), 0) AS classified,
@@ -103,7 +106,8 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
         THEN coalesce(tokens_in, 0) + coalesce(tokens_out, 0) ELSE 0 END), 0) AS saved,
       coalesce(sum(CASE WHEN route_reason = 'failover:gemini-unavailable' THEN 1 ELSE 0 END), 0) AS geminiFallbacks,
       coalesce(sum(CASE WHEN route_reason IN ('skipped:gemini-unhealthy', 'skipped:gemini-busy') THEN 1 ELSE 0 END), 0) AS geminiSkipped,
-      coalesce(sum(CASE WHEN route_reason = 'failover:cursor-unavailable' THEN 1 ELSE 0 END), 0) AS cursorFallbacks
+      coalesce(sum(CASE WHEN route_reason = 'failover:cursor-unavailable' THEN 1 ELSE 0 END), 0) AS cursorFallbacks,
+      coalesce(sum(CASE WHEN upstream_failure LIKE 'cheap:%' THEN 1 ELSE 0 END), 0) AS cheapLocalFailures
     FROM router_logs ${inWindow}`);
 
   const cheapStreamErrors = get<{ n: number }>(
@@ -168,6 +172,7 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     geminiFallbacks: summary.geminiFallbacks,
     geminiSkipped: summary.geminiSkipped,
     cursorFallbacks: summary.cursorFallbacks,
+    cheapLocalFailures: summary.cheapLocalFailures,
   };
 }
 
@@ -219,6 +224,7 @@ export function renderStats(s: RouterStats): string {
     ['Fallbacks cheap → Anthropic', fmt(s.fallbacks)],
     ['Fallbacks Gemini → Claude', fmt(s.geminiFallbacks)],
     ['Fallbacks Cursor → next tier', fmt(s.cursorFallbacks)],
+    ['Fallbacks local Ollama → next tier', fmt(s.cheapLocalFailures)],
     ['Scored by JEV', fmt(s.classified)],
     ['Repeated prompts (extra sends)', `${fmt(s.repeatedPrompts)} (${fmt(s.repeatedSends)})`],
     ['Estimated Anthropic tokens saved', fmt(s.estimatedTokensSaved)],

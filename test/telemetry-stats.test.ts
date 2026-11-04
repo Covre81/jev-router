@@ -21,6 +21,23 @@ const row = (over: Partial<NewRouterLog>): NewRouterLog => ({
   ...over,
 });
 
+describe('local Ollama fallback failures', () => {
+  // Regression: when the local Ollama failed (e.g. empty answer) the turn went on to Claude
+  // carrying only Flash's reason, so no counter ever showed the Ollama hop failing.
+  it('counts rows whose upstream failure came from the cheap hop, not Flash skips', () => {
+    const db = openTelemetryDb(':memory:');
+    const sink = new SqliteTelemetry(db, { flushIntervalMs: 60_000 });
+    sink.record(row({ routeReason: 'skipped:gemini-busy', upstreamFailure: 'cheap:empty', httpStatus: 200 }));
+    sink.record(row({ finalProvider: 'openai', routeReason: 'cheap:local-fallback', upstreamFailure: 'skipped' }));
+    sink.record(row({ routeReason: 'skipped:gemini-busy', upstreamFailure: 'skipped' }));
+    sink.flush();
+
+    const s = computeStats(db);
+    assert.equal(s.cheapLocalFailures, 1);
+    assert.match(renderStats(s), /Fallbacks local Ollama → next tier\s+1\n/);
+  });
+});
+
 describe('telemetry → stats', () => {
   it('aggregates diversion, fallbacks, repeats and estimated savings', async () => {
     const db = openTelemetryDb(':memory:');

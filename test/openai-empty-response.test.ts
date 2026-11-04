@@ -134,9 +134,11 @@ describe('cheap provider: empty answer is a failure, not a response', () => {
       classifierMaxChars: 4000,
       classifierTimeoutMs: 1500,
     } as any);
+    const logs: any[] = [];
     const proxy = buildServer({
       config,
       router,
+      telemetry: { record: (entry: any) => logs.push(entry), close: async () => {} },
       providers: { primary: new AnthropicProvider(config.primary), cheap: new OpenAICompatibleProvider(config.cheap!) },
     } as any);
     await proxy.listen({ port: 0, host: '127.0.0.1' });
@@ -152,6 +154,11 @@ describe('cheap provider: empty answer is a failure, not a response', () => {
       assert.equal(anthropicHits, 1);
       assert.match(String(res.headers['x-jev-route']), /^primary/);
       assert.match(text, /claude ok/);
+      // The Ollama hop's failure must be measurable, not hidden behind Flash's reason.
+      await new Promise((r) => setTimeout(r, 50));
+      const turn = logs.find((l) => l.requestClass !== 'auxiliary' && l.finalProvider === 'anthropic');
+      assert.ok(turn, 'the turn served by Claude is logged');
+      assert.equal(turn.upstreamFailure, 'cheap:empty');
     } finally {
       await proxy.close();
     }

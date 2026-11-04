@@ -499,16 +499,20 @@ export function buildServer({
       if (!provider) return { kind: 'failed' };
       const hopStart = performance.now();
       let res: ProviderResult;
+      // The `cheap:` prefix keeps this hop's failure apart from Flash's in upstream_failure;
+      // route_reason stays Flash's (it drives Gemini-skip stats and the Claude escalation).
+      // ponytail: a later hop that also fails (Argon) overwrites it, last failure wins as for every hop.
+      const failed = (reason: string) => {
+        logHopFailure('cheap', reason, performance.now() - hopStart);
+        upstreamFailureState = { failure: `cheap:${failureCode(reason)}` };
+        return { kind: 'failed' as const };
+      };
       try {
         res = await provider.send(r);
       } catch (err) {
-        logHopFailure('cheap', err instanceof Error ? err.message : String(err), performance.now() - hopStart);
-        return { kind: 'failed' };
+        return failed(err instanceof Error ? err.message : String(err));
       }
-      if (res.kind !== 'response') {
-        logHopFailure('cheap', res.reason, performance.now() - hopStart);
-        return { kind: 'failed' };
-      }
+      if (res.kind !== 'response') return failed(res.reason);
       return { kind: 'response', result: res };
     };
 
