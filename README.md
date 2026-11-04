@@ -350,14 +350,48 @@ provider's health (`unknown | up | down`). The build stamps
 `dist/build-info.json` (`git rev-parse --short=12 HEAD` + time). For
 `npm run dev` (tsx watch), set `SUPERVISOR_ENABLED=false`.
 
-**Cheap provider health.** The worker polls `GET {CHEAP_BASE_URL}/models`
-every `CHEAP_HEALTH_INTERVAL_MS` (30 s). While it is `down`, a turn routed
-cheap goes to Anthropic with reason `skipped:cheap-unhealthy`, without
-spending an attempt and without pinning the conversation to Anthropic: it
-returns to cheap once the provider is back. Caveat: Ollama's `/models` proves
-the daemon is up, not that ollama.com serves a `*-cloud` model.
+> **2026-11-01 — the cheap route is gone as a primary tier (see commits
+> `01f68ad`, `340c797`): Gemini via `agy` replaced it as the default free
+> tier, then Argon/Cursor were added. The health-probe paragraph that used
+> to live here (`cheap-health.ts`, `/models` polling) was removed with it
+> and is not back. What follows (`CHEAP_ROUTE=fallback`) is a new, narrower
+> feature: a local Ollama hop tried once, only after Flash (Gemini) itself
+> reports busy/unhealthy/unavailable for that turn. It never replaces
+> Gemini and is off by default. The rest of this README (the routing-model
+> ADR above, `/healthz`'s old `cheap` field) still describes the pre-Gemini
+> architecture and hasn't been refreshed — ask for that separately if you
+> want it brought current.**
 
-**Cheap provider presets:**
+**Local Ollama fallback (`CHEAP_ROUTE=fallback`).** Off by default
+(`CHEAP_ROUTE=off`). When set, every turn Flash would otherwise have served
+gets one extra try against `CHEAP_BASE_URL` (OpenAI-compatible
+`/chat/completions`) before escalating to Argon/Claude, but only once Flash
+itself failed for that turn (`skipped:gemini-busy`,
+`skipped:gemini-unhealthy`, `failover:gemini-unavailable`) — it is never
+tried instead of Flash, and a turn with an image/document/tool_choice skips
+it the same way it skips Flash. No standing health probe: a bad
+`CHEAP_BASE_URL` just costs one bounded `CHEAP_TIMEOUT_MS` (default 60 s) per
+affected turn before falling through to Argon/Claude, same as any other
+failed hop. Served turns show up with `route: cheap` (`x-jev-route: cheap;
+reason=cheap:local-fallback`) and bill through the existing `cheap`/`openai`
+telemetry columns (`stats`, `CHEAP_PRICE_*_PER_MTOK`).
+
+```bash
+CHEAP_ROUTE=fallback
+CHEAP_BASE_URL=http://<servidor>:11434/v1
+CHEAP_API_KEY=ollama
+CHEAP_MODEL=gpt-oss:20b-cloud
+```
+
+Before turning this on against a real Ollama endpoint: confirm the model
+answers tool calls (`ollama show <model>` lists the `tools` capability —
+Claude Code always offers tools) and set `OLLAMA_CONTEXT_LENGTH` on the
+server, or Ollama silently truncates Claude Code's system prompt + tool
+schemas. Validate with `npx tsx scripts/bench.ts` against the real endpoint
+before relying on it; `CHEAP_PRICE_INPUT_PER_MTOK` / `_OUTPUT_PER_MTOK` stay
+unset for a self-hosted model (correct default: $0).
+
+**Cheap provider presets (only relevant with `CHEAP_ROUTE=fallback`):**
 
 ```bash
 # Ollama Cloud via the local daemon (default, free plan)

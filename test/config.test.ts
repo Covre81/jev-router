@@ -58,16 +58,10 @@ describe('removedEnvSet', () => {
 });
 
 describe('Ollama / cheap keys ignored if present', () => {
-  it('ignores all legacy cheap env vars without error', () => {
+  it('ignores dead legacy cheap env vars without error (never resurrected)', () => {
     const legacy = {
       ...base,
-      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
-      CHEAP_ROUTE: 'on',
-      CHEAP_API_KEY: 'ollama',
-      CHEAP_MODEL: 'gpt-oss:20b-cloud',
-      CHEAP_MAX_OUTPUT_TOKENS: '8192',
       CHEAP_CONTEXT_TOKENS: '131072',
-      CHEAP_TIMEOUT_MS: '60000',
       CHEAP_MODEL_STANDARD: 'gemma4:31b-cloud',
       CHEAP_HEALTH_ENABLED: 'true',
       ROUTER_STANDARD_ROUTE: 'cheap',
@@ -77,8 +71,37 @@ describe('Ollama / cheap keys ignored if present', () => {
     };
     const config = loadConfig(legacy);
     assert.ok(config);
-    assert.equal((config as any).cheap, undefined);
-    assert.equal((config as any).cheapRoute, undefined);
+    assert.equal(config.cheap, undefined);
+  });
+
+  it('CHEAP_ROUTE defaults to off: no local fallback unless opted in', () => {
+    const config = loadConfig({ ...base });
+    assert.equal(config.cheap, undefined);
+  });
+
+  it('rejects the pre-removal CHEAP_ROUTE=on value (full replacement is gone, not resurrected)', () => {
+    assert.throws(() => loadConfig({ ...base, CHEAP_ROUTE: 'on' }));
+  });
+
+  it('CHEAP_ROUTE=fallback wires a local Ollama provider used only after Gemini fails', () => {
+    const config = loadConfig({
+      ...base,
+      CHEAP_ROUTE: 'fallback',
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_API_KEY: 'ollama',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+    });
+    assert.deepEqual(config.cheap, {
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+      model: 'gpt-oss:20b-cloud',
+      maxOutputTokens: 8_192,
+      timeoutMs: 60_000,
+    });
+  });
+
+  it('CHEAP_ROUTE=fallback without the companion vars fails loudly', () => {
+    assert.throws(() => loadConfig({ ...base, CHEAP_ROUTE: 'fallback' }));
   });
 });
 

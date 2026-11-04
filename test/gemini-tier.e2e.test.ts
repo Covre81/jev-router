@@ -5,7 +5,7 @@ import { after, before, describe, it, beforeEach } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { request } from 'undici';
 import { EventEmitter } from 'node:events';
-import { Writable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -36,7 +36,10 @@ describe('Gemini Tier E2E', () => {
   let telemetryDb: any; // Add telemetryDb
   let spawnCalls = 0;
   let spawnQueue: (() => any)[] = [];
-  
+  let cheapCalls = 0;
+  const DEFAULT_DIST = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1.0 };
+  let classifierDist: any = DEFAULT_DIST;
+
   before(async () => {
     anthropic = createServer((req, res) => {
       anthropicHits++;
@@ -61,6 +64,8 @@ describe('Gemini Tier E2E', () => {
     anthropicHits = 0;
     spawnCalls = 0;
     spawnQueue = [];
+    cheapCalls = 0;
+    classifierDist = DEFAULT_DIST;
   });
 
   const fakeSpawnFn = (bin: string, args: string[], opts: any) => {
@@ -94,12 +99,12 @@ describe('Gemini Tier E2E', () => {
     telemetryDb = openTelemetryDb(join(dbDir, 'test-' + randomUUID() + '.db'));
     telemetry = new SqliteTelemetry(telemetryDb, { flushIntervalMs: 60_000 });
     const store = new TtlLruStore<any>(100, 60_000);
-    const classifier = { name: 'scripted', classify: async () => ({ simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1.0 }) };
+    const classifier = { name: 'scripted', classify: async () => classifierDist };
     
     const providers = {
       primary: new AnthropicProvider(config.primary),
-      cheap: { send: async () => ({ kind: 'response', status: 200, headers: {}, body: null }) } as any,
-      gemini: config.gemini ? new GeminiCliProvider({ ...config.gemini, spawnFn: fakeSpawnFn } as any) : undefined
+      gemini: config.gemini ? new GeminiCliProvider({ ...config.gemini, spawnFn: fakeSpawnFn } as any) : undefined,
+      ...(config.cheap ? { cheap: { send: async () => (cheapCalls++, { kind: 'response', status: 200, headers: {}, body: Readable.from([JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'local ollama ok' }], stop_reason: 'end_turn', usage: {} })]) }) } as any } : {}),
     };
 
     const router = new Router(classifier as any, store, {
@@ -321,6 +326,85 @@ describe('Gemini Tier E2E', () => {
       assert.equal(anthropicHits, 1);
       await r1.body.text();
       await r2.body.text();
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
+  it('busy falls back to local Ollama (CHEAP_ROUTE=fallback) instead of Claude, when configured', async () => {
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on',
+      GEMINI_TIER_CONCURRENCY: '1',
+      CHEAP_ROUTE: 'fallback',
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+    });
+    try {
+      spawnQueue.push(() => {
+        const fakeChild = new EventEmitter() as any;
+        fakeChild.stdin = new Writable({ write(c, e, cb) { cb(); } });
+        fakeChild.stdout = new EventEmitter();
+        fakeChild.stderr = new EventEmitter();
+        fakeChild.pid = 304;
+        setTimeout(() => {
+          fakeChild.stdout.emit('data', Buffer.from(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'slow gemini ok', usage: {} } }) + '\n'));
+          fakeChild.emit('close', 0);
+        }, 200);
+        return fakeChild;
+      });
+
+      const p1 = request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 't1' }] })
+      });
+      await new Promise(r => setTimeout(r, 20));
+
+      const p2 = request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 't2' }] })
+      });
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      assert.equal(r1.headers['x-jev-route'], 'free; reason=gemini:text-only');
+      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=cheap:local-fallback');
+      assert.equal(anthropicHits, 0); // local fallback served it: Claude never saw this turn
+      await r1.body.text();
+      await r2.body.text();
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
+  // Regression: a simple turn with tool_choice any was routed 'free'; the server faked a
+  // Flash skip and the local Ollama fallback answered a turn that must reach Claude.
+  it('tool_choice any never reaches Flash or the local Ollama fallback', async () => {
+    classifierDist = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on',
+      CHEAP_ROUTE: 'fallback',
+      CHEAP_BASE_URL: 'http://127.0.0.1:1',
+      CHEAP_MODEL: 'qwen2.5:14b',
+    });
+    try {
+      const res = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude',
+          messages: [{ role: 'user', content: 'hi' }],
+          tools: [{ name: 'get_time', input_schema: { type: 'object', properties: {} } }],
+          tool_choice: { type: 'any' },
+        }),
+      });
+      await res.body.text();
+      assert.equal(cheapCalls, 0);
+      assert.equal(spawnCalls, 0);
+      assert.equal(anthropicHits, 1);
+      assert.equal(res.headers['x-jev-route'], 'primary; reason=gemini:ineligible-input');
     } finally {
       await proxy.close();
       telemetry.close();

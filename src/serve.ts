@@ -18,6 +18,7 @@ import { noopTelemetry, SqliteTelemetry, type TelemetrySink } from './telemetry/
 import { ensureAgyHome } from './providers/gemini/isolation.js';
 import { GeminiCliProvider } from './providers/gemini/provider.js';
 import { CursorCliProvider } from './providers/cursor/provider.js';
+import { OpenAICompatibleProvider } from './providers/openai/provider.js';
 import { CircuitBreaker } from './providers/breaker.js';
 import { ModelQuotaState } from './providers/quota-state.js';
 
@@ -136,6 +137,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
           }),
         }
       : {}),
+    ...(config.cheap ? { cheap: new OpenAICompatibleProvider(config.cheap) } : {}),
   };
 
   const quotaState = new ModelQuotaState();
@@ -172,6 +174,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       primary: config.primary.baseUrl,
       argon: config.argon.enabled ? config.argon.modelMedium : 'off',
       cursor: config.cursor ? config.cursor.model : 'off',
+      cheap: config.cheap ? `${config.cheap.model} (fallback)` : 'off',
       telemetry: config.telemetry.dbPath ?? 'disabled',
     },
     'jev-router ready',

@@ -32,6 +32,8 @@ export interface ServerDeps {
     readonly primary: Provider;
     readonly gemini?: Provider | undefined;
     readonly cursor?: Provider | undefined;
+    /** Local Ollama fallback: only tried when Flash (Gemini) is busy/unhealthy/unavailable. */
+    readonly cheap?: Provider | undefined;
   };
   readonly telemetry?: TelemetrySink;
   readonly build?: BuildInfo;
@@ -296,7 +298,7 @@ export function buildServer({
 
     let upstreamFailureState: { failure?: string; status?: number; rateLimitHeaders?: string } | undefined;
 
-    const logHopFailure = (hop: 'flash' | 'argon' | 'agy-claude' | 'cursor' | 'claude', rawReason: string, durationMs: number) => {
+    const logHopFailure = (hop: 'flash' | 'argon' | 'agy-claude' | 'cursor' | 'claude' | 'cheap', rawReason: string, durationMs: number) => {
       const code = failureCode(rawReason);
       req.log.warn({ hop, reason: code, detail: rawReason.slice(0, 200), ms: Math.round(durationMs) }, 'hop failed');
     };
@@ -485,6 +487,29 @@ export function buildServer({
       } finally {
         breaker.release(outcome);
       }
+    };
+
+    /**
+     * Local Ollama fallback: tried once, only after Flash itself gave up
+     * (busy/unhealthy/unavailable). Never retried, never bumped — on failure
+     * the existing Argon/Claude cascade below still runs unchanged.
+     */
+    const tryCheap = async (r: ProviderRequest): Promise<{ kind: 'response'; result: ProviderResult } | { kind: 'failed' }> => {
+      const provider = providers.cheap;
+      if (!provider) return { kind: 'failed' };
+      const hopStart = performance.now();
+      let res: ProviderResult;
+      try {
+        res = await provider.send(r);
+      } catch (err) {
+        logHopFailure('cheap', err instanceof Error ? err.message : String(err), performance.now() - hopStart);
+        return { kind: 'failed' };
+      }
+      if (res.kind !== 'response') {
+        logHopFailure('cheap', res.reason, performance.now() - hopStart);
+        return { kind: 'failed' };
+      }
+      return { kind: 'response', result: res };
     };
 
     const getArgonModel = (profile: ArgonProfile): string => {
@@ -825,6 +850,15 @@ export function buildServer({
           { model: 'claude-sonnet-5-5', effort: 'low' },
         );
         return relayClaude(base, routeDec);
+      }
+
+      if (providers.cheap) {
+        const cheapAttempt = await tryCheap(activeBase);
+        if (cheapAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'free');
+          const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'free', reason: 'cheap:local-fallback', substitutedFrom: flashModel };
+          return safeRelay(cheapAttempt.result, routeDec, exchange('cheap', config.cheap?.model));
+        }
       }
 
       const flashFailureReason = flashRes.reason;

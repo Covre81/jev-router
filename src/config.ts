@@ -112,6 +112,15 @@ const Env = z
     TIER_FIRST_BYTE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     TIER_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     KEEPALIVE_INTERVAL_MS: z.coerce.number().int().positive().default(15_000),
+
+    // Local Ollama fallback: only tried when Flash (Gemini) is busy/unhealthy/unavailable,
+    // never replaces it. Off by default (2026-11-01 decision: keep Gemini as the primary cheap tier).
+    CHEAP_ROUTE: z.enum(['off', 'fallback']).default('off'),
+    CHEAP_BASE_URL: z.url().optional(),
+    CHEAP_API_KEY: z.string().min(1).optional(),
+    CHEAP_MODEL: z.string().min(1).optional(),
+    CHEAP_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(8_192),
+    CHEAP_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
   })
   .superRefine((env, ctx) => {
     if (env.QUOTA_CRITICAL < env.QUOTA_PRESSURE) {
@@ -133,6 +142,11 @@ const Env = z
         path: ['PROXY_AUTH_TOKEN'],
         message: 'required when UPSTREAM_AUTH_MODE=inject and HOST is not loopback',
       });
+    }
+    if (env.CHEAP_ROUTE === 'fallback') {
+      if (!env.CHEAP_BASE_URL) ctx.addIssue({ code: 'custom', path: ['CHEAP_BASE_URL'], message: 'required when CHEAP_ROUTE=fallback' });
+      if (!env.CHEAP_API_KEY) ctx.addIssue({ code: 'custom', path: ['CHEAP_API_KEY'], message: 'required when CHEAP_ROUTE=fallback' });
+      if (!env.CHEAP_MODEL) ctx.addIssue({ code: 'custom', path: ['CHEAP_MODEL'], message: 'required when CHEAP_ROUTE=fallback' });
     }
   });
 
@@ -258,6 +272,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     cursorCoding: e.CURSOR_CODING === 'on',
     cursorCodingMaxTextOnly: e.CURSOR_CODING_MAX_TEXT_ONLY,
     cursorCodingMinMass: e.CURSOR_CODING_MIN_MASS,
+    cheap:
+      e.CHEAP_ROUTE === 'fallback'
+        ? {
+            baseUrl: trimSlash(e.CHEAP_BASE_URL!),
+            apiKey: e.CHEAP_API_KEY!,
+            model: e.CHEAP_MODEL!,
+            maxOutputTokens: e.CHEAP_MAX_OUTPUT_TOKENS,
+            timeoutMs: e.CHEAP_TIMEOUT_MS,
+          }
+        : undefined,
     timeouts: {
       firstByteMs: e.TIER_FIRST_BYTE_TIMEOUT_MS,
       idleMs: e.TIER_IDLE_TIMEOUT_MS,
