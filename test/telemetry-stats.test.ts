@@ -38,6 +38,30 @@ describe('local Ollama fallback failures', () => {
   });
 });
 
+describe('failover counters', () => {
+  // Regression: "Fallbacks cheap → Anthropic" summed every failover:* reason, so Anthropic 429s
+  // cascading to Cursor/Flash (the opposite direction) and Cursor failovers (already counted
+  // on their own line) were reported as legacy cheap-route fallbacks.
+  it('keeps the legacy cheap route, Anthropic 429 cascade and Cursor failovers apart', () => {
+    const db = openTelemetryDb(':memory:');
+    const sink = new SqliteTelemetry(db, { flushIntervalMs: 60_000 });
+    sink.record(row({ routeReason: 'failover:cheap-unavailable', fallbackTriggered: true } as Partial<NewRouterLog>));
+    sink.record(row({ routeReason: 'failover:primary-rate-limited', finalProvider: 'cursor', fallbackTriggered: true } as Partial<NewRouterLog>));
+    sink.record(row({ routeReason: 'failover:primary-rate-limited', finalProvider: 'gemini', fallbackTriggered: true } as Partial<NewRouterLog>));
+    sink.record(row({ routeReason: 'failover:cursor-unavailable', finalProvider: 'gemini', fallbackTriggered: true } as Partial<NewRouterLog>));
+    sink.flush();
+
+    const s = computeStats(db);
+    assert.equal(s.fallbacks, 1);
+    assert.equal(s.primaryRateLimitedFailovers, 2);
+    assert.equal(s.cursorFallbacks, 1);
+    const out = renderStats(s);
+    assert.match(out, /Fallbacks legacy cheap route → Anthropic\s+1\n/);
+    assert.match(out, /Failovers Anthropic 429 → next tier\s+2\n/);
+    assert.doesNotMatch(out, /Fallbacks cheap → Anthropic/);
+  });
+});
+
 describe('telemetry → stats', () => {
   it('aggregates diversion, fallbacks, repeats and estimated savings', async () => {
     const db = openTelemetryDb(':memory:');

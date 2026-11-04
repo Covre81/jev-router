@@ -51,6 +51,8 @@ export interface RouterStats {
   readonly cursorFallbacks: number;
   /** Turns the local Ollama fallback failed (empty answer, timeout…); the cascade served them elsewhere. */
   readonly cheapLocalFailures: number;
+  /** Anthropic answered 429/529 and the cascade served the turn on Cursor or Flash. */
+  readonly primaryRateLimitedFailovers: number;
 }
 
 export interface StatsOptions {
@@ -98,10 +100,12 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     geminiSkipped: number;
     cursorFallbacks: number;
     cheapLocalFailures: number;
+    primaryRateLimitedFailovers: number;
   }>(`
     SELECT count(*) AS total, min(created_at) AS firstAt, max(created_at) AS lastAt,
       coalesce(sum(CASE WHEN jev_decision IS NOT NULL THEN 1 ELSE 0 END), 0) AS classified,
-      coalesce(sum(CASE WHEN fallback_triggered = 1 AND route_reason != 'failover:gemini-unavailable' THEN 1 ELSE 0 END), 0) AS fallbacks,
+      coalesce(sum(CASE WHEN route_reason = 'failover:cheap-unavailable' THEN 1 ELSE 0 END), 0) AS fallbacks,
+      coalesce(sum(CASE WHEN route_reason = 'failover:primary-rate-limited' THEN 1 ELSE 0 END), 0) AS primaryRateLimitedFailovers,
       coalesce(sum(CASE WHEN final_provider IN ('openai', 'gemini', 'cursor') AND outcome = 'ok'
         THEN coalesce(tokens_in, 0) + coalesce(tokens_out, 0) ELSE 0 END), 0) AS saved,
       coalesce(sum(CASE WHEN route_reason = 'failover:gemini-unavailable' THEN 1 ELSE 0 END), 0) AS geminiFallbacks,
@@ -173,6 +177,7 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     geminiSkipped: summary.geminiSkipped,
     cursorFallbacks: summary.cursorFallbacks,
     cheapLocalFailures: summary.cheapLocalFailures,
+    primaryRateLimitedFailovers: summary.primaryRateLimitedFailovers,
   };
 }
 
@@ -221,7 +226,8 @@ export function renderStats(s: RouterStats): string {
       'Claude quota (last seen)',
       s.lastQuota ? `${Math.round(s.lastQuota.utilization * 100)}% ${s.lastQuota.window}` : '—',
     ],
-    ['Fallbacks cheap → Anthropic', fmt(s.fallbacks)],
+    ['Fallbacks legacy cheap route → Anthropic', fmt(s.fallbacks)],
+    ['Failovers Anthropic 429 → next tier', fmt(s.primaryRateLimitedFailovers)],
     ['Fallbacks Gemini → Claude', fmt(s.geminiFallbacks)],
     ['Fallbacks Cursor → next tier', fmt(s.cursorFallbacks)],
     ['Fallbacks local Ollama → next tier', fmt(s.cheapLocalFailures)],
