@@ -82,7 +82,10 @@ const usageOf = (u: z.infer<typeof Usage> | null | undefined) => ({
   output_tokens: u?.completion_tokens ?? 0,
 });
 
-export function toAnthropicMessage(payload: unknown, model: string): object {
+export function toAnthropicMessage(
+  payload: unknown,
+  model: string,
+): { readonly content: readonly object[]; readonly stop_reason: StopReason; readonly [key: string]: unknown } {
   const parsed = Completion.safeParse(payload);
   if (!parsed.success) throw new TranslationError('unexpected chat completion shape');
   const choice = parsed.data.choices[0]!;

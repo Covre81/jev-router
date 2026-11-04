@@ -62,6 +62,8 @@ export class OpenAICompatibleProvider implements Provider {
     if (!chat.stream) {
       try {
         const message = toAnthropicMessage(await res.body.json(), this.options.model);
+        // A reasoning model can spend max_tokens thinking and answer nothing.
+        if (message.content.length === 0) return { kind: 'unavailable', reason: `empty response (${message.stop_reason})` };
         return {
           kind: 'response',
           status: 200,
@@ -79,11 +81,35 @@ export class OpenAICompatibleProvider implements Provider {
     const events = withErrorEvent(toAnthropicStream(readSseData(res.body), this.options.model), () => {
       if (!req.signal.aborted) req.onStreamFailure?.();
     });
+    // ponytail: hold events until the first content block, so a reasoning-only answer
+    // fails over before the client sees a byte; after that, text streams live as before.
+    // No content block before message_delta, an error event or the end = nothing for the client.
+    const it = events[Symbol.asyncIterator]();
+    const head: string[] = [];
+    let hasContent = false;
+    for (let next = await it.next(); !next.done; next = await it.next()) {
+      head.push(next.value);
+      if (next.value.startsWith('event: content_block_start')) {
+        hasContent = true;
+        break;
+      }
+      if (next.value.startsWith('event: message_delta') || next.value.startsWith('event: error')) break;
+    }
+    if (!hasContent) {
+      await it.return(undefined);
+      const error = head.find((e) => e.startsWith('event: error'));
+      const detail = error ? (JSON.parse(error.slice(error.indexOf('data: ') + 6)) as { error: { message: string } }).error.message : '';
+      return { kind: 'unavailable', reason: error ? `stream failed before content: ${detail}` : 'empty response (stream)' };
+    }
+    async function* replay(): AsyncGenerator<string> {
+      yield* head;
+      for (let next = await it.next(); !next.done; next = await it.next()) yield next.value;
+    }
     return {
       kind: 'response',
       status: 200,
       headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
-      body: Readable.from(events),
+      body: Readable.from(replay()),
     };
   }
 }

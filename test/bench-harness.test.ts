@@ -104,10 +104,12 @@ describe('bench harness through OpenAICompatibleProvider', () => {
     assert.match(r.toolErrors[1] ?? '', /^Read\(\{"file_path":"math.ts"\}\): InputValidationError: .*absolute path/);
   });
 
-  it('reports invalid tool JSON as stream_error (too late for the router to fail over)', async () => {
+  // Tool calls are buffered to the end, so invalid JSON breaks the stream before any block
+  // reaches the client: the provider reports it unavailable and the router can still fail over.
+  it('reports invalid tool JSON before any content as a fail-over, not a stream_error', async () => {
     script = [toolCall('Read', '{"file_path": "/workspace/math.ts"')];
     const r = await runTrial(provider, task('fix-bug'), options);
-    assert.equal(r.outcome, 'stream_error');
+    assert.equal(r.outcome, 'fallback');
     assert.match(r.detail ?? '', /invalid JSON/);
   });
 
