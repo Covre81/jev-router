@@ -89,6 +89,9 @@ export function isQuotaProbe(body: MessagesBody | undefined): boolean {
   return typeof body?.max_tokens === 'number' && body.max_tokens <= 1;
 }
 
+/** Failure codes that point at the `agy` process or network rather than at one model. */
+const AGY_UNWELL: ReadonlySet<string> = new Set(['timeout', 'first-byte-timeout', 'idle-timeout', 'network']);
+
 export function failureCode(reason: string): string {
   if (reason.startsWith('HTTP ')) {
     const match = reason.match(/^HTTP \d{3}/);
@@ -826,6 +829,8 @@ export function buildServer({
 
       // Flash eligibility (tool_choice, image, document) is decided once, in Router.decideTier.
       const flashRes = await tryFlash(activeBase);
+      // Read the cause now: later hops (Argon, the local Ollama fallback) overwrite upstreamFailureState.
+      const flashAgyUnwell = flashRes.kind === 'failed' && AGY_UNWELL.has(upstreamFailureState?.failure ?? '');
       if (flashRes.kind === 'response') {
         router.markFallbackLoop(decision, 'free');
         return safeRelay(flashRes.result, decision, exchange('free', config.gemini?.model));
@@ -868,7 +873,10 @@ export function buildServer({
 
       const flashFailureReason = flashRes.reason;
       let argonFailed = false;
-      if (config.argon.enabled && flashRes.kind !== 'skipped') {
+      // Argon runs through the same `agy` as Flash. A timeout or network loss (flashAgyUnwell, read
+      // right after tryFlash) means agy itself is unwell, and history shows Argon never rescued such
+      // a turn while adding up to its own 180 s limit.
+      if (config.argon.enabled && flashRes.kind !== 'skipped' && !flashAgyUnwell) {
         let curProfile: ArgonProfile | null = selectArgonProfile(decision.distribution ?? { simple: 1, standard: 0, structural: 0 }) ?? 'low';
         while (curProfile !== null) {
           const argonAttempt = await tryArgon(curProfile, activeBase);
