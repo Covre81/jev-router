@@ -38,6 +38,7 @@ describe('Gemini Tier E2E', () => {
   let spawnQueue: (() => any)[] = [];
   let cheapCalls = 0;
   let cheapQueue: (() => any)[] = [];
+  let cheapFails = false;
   const DEFAULT_DIST = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1.0 };
   let classifierDist: any = DEFAULT_DIST;
 
@@ -67,6 +68,7 @@ describe('Gemini Tier E2E', () => {
     spawnQueue = [];
     cheapCalls = 0;
     cheapQueue = [];
+    cheapFails = false;
     classifierDist = DEFAULT_DIST;
   });
 
@@ -105,7 +107,7 @@ describe('Gemini Tier E2E', () => {
     
     const providers = {
       primary: new AnthropicProvider(config.primary),
-      gemini: config.gemini ? new GeminiCliProvider({ ...config.gemini, spawnFn: fakeSpawnFn } as any) : undefined,
+      gemini: config.gemini ? new GeminiCliProvider({ ...config.gemini, firstByteTimeoutMs: config.timeouts.firstByteMs, spawnFn: fakeSpawnFn } as any) : undefined,
       ...(config.cheap
         ? {
             cheap: {
@@ -113,6 +115,7 @@ describe('Gemini Tier E2E', () => {
                 cheapCalls++;
                 const fn = cheapQueue.shift();
                 if (fn) return fn();
+                if (cheapFails) return { kind: 'unavailable', reason: 'empty response' };
                 return {
                   kind: 'response',
                   status: 200,
@@ -643,5 +646,87 @@ describe('Gemini Tier E2E', () => {
       await proxy.close();
       telemetry.close();
     }
+  });
+
+  // The Argon hop runs through the same `agy` as Flash: when Flash timed out or lost the network,
+  // history shows Argon never rescued the turn and cost up to 180 s more before Claude answered.
+  describe('Argon after a Flash failure', () => {
+    const silent = () => {
+      const child = new EventEmitter() as any;
+      child.pid = undefined; // nothing real to kill
+      child.stdin = new Writable({ write(c, e, cb) { cb(); } });
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      return child;
+    };
+    const exitsWithError = () => {
+      const child = new EventEmitter() as any;
+      child.stdin = new Writable({ write(c, e, cb) { cb(); } });
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.pid = 302;
+      setTimeout(() => child.emit('close', 1), 5);
+      return child;
+    };
+    // A simple, text-only turn: routes to Flash first (a structural one would go straight to Argon).
+    beforeEach(() => {
+      classifierDist = { simple: 0.97, standard: 0.02, structural: 0.01, risk: 0.05, textOnly: 1.0 };
+    });
+    const ask = (url: string) =>
+      request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'hello' }] }),
+      });
+
+    it('skips Argon when Flash timed out waiting for the first byte', async () => {
+      const { proxy, url } = await createTestServer({ GEMINI_TIER: 'on', ARGON_TIER: 'on', TIER_FIRST_BYTE_TIMEOUT_MS: '60' });
+      spawnQueue.push(silent, silent, silent);
+      try {
+        const res = await ask(url);
+        await res.body.text();
+        assert.equal(res.statusCode, 200);
+        assert.equal(spawnCalls, 1, 'only Flash was spawned');
+        assert.equal(anthropicHits, 1);
+        assert.equal(res.headers['x-jev-route'], 'primary; reason=failover:gemini-unavailable');
+      } finally {
+        await proxy.close();
+        telemetry.close();
+      }
+    });
+
+    it('skips Argon after a Flash timeout even when the local Ollama also fails', async () => {
+      // Regression: tryCheap overwrote the failure cause, so the timeout was forgotten and Argon ran.
+      cheapFails = true;
+      const { proxy, url } = await createTestServer({
+        GEMINI_TIER: 'on', ARGON_TIER: 'on', TIER_FIRST_BYTE_TIMEOUT_MS: '60',
+        CHEAP_ROUTE: 'fallback', CHEAP_BASE_URL: 'http://127.0.0.1:1', CHEAP_API_KEY: 'k', CHEAP_MODEL: 'local',
+      });
+      spawnQueue.push(silent, silent, silent);
+      try {
+        const res = await ask(url);
+        await res.body.text();
+        assert.equal(cheapCalls, 1, 'Ollama was tried');
+        assert.equal(spawnCalls, 1, 'only Flash was spawned');
+        assert.equal(res.headers['x-jev-route'], 'primary; reason=failover:gemini-unavailable');
+      } finally {
+        await proxy.close();
+        telemetry.close();
+      }
+    });
+
+    it('still tries Argon after an ordinary Flash failure', async () => {
+      const { proxy, url } = await createTestServer({ GEMINI_TIER: 'on', ARGON_TIER: 'on' });
+      spawnQueue.push(exitsWithError, exitsWithError, exitsWithError);
+      try {
+        const res = await ask(url);
+        await res.body.text();
+        assert.equal(res.headers['x-jev-route'], 'primary; reason=escalated:argon-failed', 'Argon was tried');
+        assert.equal(anthropicHits, 1);
+      } finally {
+        await proxy.close();
+        telemetry.close();
+      }
+    });
   });
 });

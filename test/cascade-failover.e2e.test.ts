@@ -7,7 +7,7 @@ import { loadConfig } from '../src/config.js';
 import { Router } from '../src/routing/router.js';
 import { TtlLruStore } from '../src/routing/session-store.js';
 import { CircuitBreaker } from '../src/providers/breaker.js';
-import { buildServer } from '../src/proxy/server.js';
+import { buildServer, retryAfterMs } from '../src/proxy/server.js';
 import type { Provider, ProviderRequest, ProviderResult } from '../src/providers/provider.js';
 
 const jsonResponse = (text: string, toolUse = false): ProviderResult => ({
@@ -48,6 +48,7 @@ async function createTestServer(opts: {
   primary?: Provider & { hits: number };
   classification?: any;
   quota?: () => any;
+  telemetry?: any;
 }) {
   const config = loadConfig({
     CLASSIFIER: 'heuristic',
@@ -74,6 +75,7 @@ async function createTestServer(opts: {
     config,
     router,
     providers,
+    ...(opts.telemetry ? { telemetry: opts.telemetry } : {}),
     ...(opts.cursor ? { cursorBreaker: new CircuitBreaker(3, 300_000, 1) } : {}),
     ...(opts.gemini ? { geminiBreaker: new CircuitBreaker(3, 300_000, 1) } : {}),
   } as any);
@@ -225,6 +227,163 @@ describe('failover cascade Claude -> Cursor -> Gemini', () => {
       await r.body.text();
       assert.equal(primary.hits, 1);
       assert.equal(cursor.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
+// A 429 that says when to come back is a token-bucket refill: waiting a few seconds and asking
+// Claude again keeps the prompt cache, while failing over pays a cache miss on every tier change.
+describe('primary 429 with retry-after', () => {
+  const limited = (retryAfter?: string): ProviderResult => ({
+    kind: 'response',
+    status: 429,
+    headers: { 'content-type': 'application/json', ...(retryAfter === undefined ? {} : { 'retry-after': retryAfter }) },
+    body: Readable.from([Buffer.from(ORIGINAL_429_BODY)]),
+  });
+  const sequence = (...results: (() => ProviderResult)[]) => {
+    let i = 0;
+    return stub('primary', () => results[Math.min(i++, results.length - 1)]!());
+  };
+  const ask = (url: string) => send(url, { model: 'claude', messages: [{ role: 'user', content: 'hello' }] });
+
+  it('waits the advertised time and retries Claude once instead of failing over', async () => {
+    const primary = sequence(() => limited('0.05'), () => jsonResponse('primary ok'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor });
+    try {
+      const t0 = Date.now();
+      const r = await ask(url);
+      assert.ok(Date.now() - t0 >= 45, 'honored the advertised wait (50 ms)');
+      assert.equal(r.statusCode, 200);
+      assert.match(String(r.headers['x-jev-route']), /^primary/);
+      assert.match(await r.body.text(), /primary ok/);
+      assert.equal(primary.hits, 2);
+      assert.equal(cursor.hits, 0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('does not retry a 429 without retry-after (spend limit): goes straight to the cascade', async () => {
+    const primary = sequence(() => limited());
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor });
+    try {
+      const r = await ask(url);
+      assert.equal(r.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      await r.body.text();
+      assert.equal(primary.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('does not wait out a long retry-after: the cascade answers now', async () => {
+    const primary = sequence(() => limited('60'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor });
+    try {
+      const t0 = Date.now();
+      const r = await ask(url);
+      await r.body.text();
+      assert.ok(Date.now() - t0 < 5_000, 'did not sleep for 60 s');
+      assert.equal(r.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      assert.equal(primary.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('does not start the cascade when the client left during the wait', async () => {
+    const primary = sequence(() => limited('0.4'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor });
+    try {
+      const ac = new AbortController();
+      const pending = request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-claude-code-session-id': 'abort-s1' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'hello' }] }),
+        signal: ac.signal,
+      }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 80));
+      ac.abort();
+      await pending;
+      await new Promise((r) => setTimeout(r, 700)); // past the advertised wait
+      assert.equal(cursor.hits, 0, 'nobody is listening: no tier should be called');
+      assert.equal(primary.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('does not record a 5xx retry as retry-after:ok', async () => {
+    const logs: any[] = [];
+    const primary = sequence(() => limited('0.05'), () => ({
+      kind: 'response', status: 503, headers: { 'content-type': 'application/json' },
+      body: Readable.from([Buffer.from('{"type":"error"}')]),
+    }));
+    const { proxy, url } = await createTestServer({ primary, telemetry: { record: (e: any) => logs.push(e), close: async () => {} } });
+    try {
+      const r = await ask(url);
+      await r.body.text();
+      assert.equal(r.statusCode, 503);
+      await new Promise((r2) => setTimeout(r2, 50));
+      assert.ok(logs.length > 0);
+      assert.notEqual(logs.at(-1).upstreamFailure, 'retry-after:ok');
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  it('retries once only: a second 429 continues down the cascade', async () => {
+    const primary = sequence(() => limited('0.05'));
+    const cursor = stub('cursor', () => jsonResponse('cursor ok'));
+    const { proxy, url } = await createTestServer({ primary, cursor });
+    try {
+      const r = await ask(url);
+      assert.equal(r.headers['x-jev-route'], 'cursor; reason=failover:primary-rate-limited');
+      await r.body.text();
+      assert.equal(primary.hits, 2);
+      assert.equal(cursor.hits, 1);
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
+describe('retryAfterMs', () => {
+  it('accepts short positive waits only', () => {
+    assert.equal(retryAfterMs({ 'retry-after': '5' }), 5_000);
+    assert.equal(retryAfterMs({ 'retry-after': ['2'] }), 2_000);
+    assert.equal(retryAfterMs({ 'retry-after': '10' }), 10_000);
+    for (const bad of [undefined, '0', '-3', '11', '60', 'abc', 'Wed, 21 Oct 2026 07:28:00 GMT']) {
+      assert.equal(retryAfterMs(bad === undefined ? {} : { 'retry-after': bad }), undefined, String(bad));
+    }
+  });
+});
+
+describe('the proxy records the reaction to the previous turn on the next row', () => {
+  it('stores prev_tool_errors / prev_interrupted from the request body', async () => {
+    const logs: any[] = [];
+    const primary = stub('primary', () => jsonResponse('ok'));
+    const { proxy, url } = await createTestServer({ primary, telemetry: { record: (e: any) => logs.push(e), close: async () => {} } });
+    try {
+      const t1 = [{ role: 'user', content: 'hello' }];
+      await (await send(url, { model: 'claude', messages: t1 }, 'reaction-s1')).body.text();
+      const assistantTurn = { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] };
+      await (await send(url, {
+        model: 'claude',
+        messages: [...t1, assistantTurn, { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', is_error: true, content: 'boom' }] }],
+      }, 'reaction-s1')).body.text();
+      await (await send(url, {
+        model: 'claude',
+        messages: [...t1, assistantTurn, { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] }],
+      }, 'reaction-s1')).body.text();
+      await new Promise((r) => setTimeout(r, 50));
+      assert.deepEqual(logs.map((l) => [l.prevToolErrors, l.prevInterrupted]), [[0, false], [1, false], [0, true]]);
     } finally {
       await proxy.close();
     }
