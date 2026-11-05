@@ -648,6 +648,57 @@ describe('Gemini Tier E2E', () => {
     }
   });
 
+  // Regression (PR #11 review): with CHEAP_ROUTE=first the local Ollama ran on every free turn with
+  // no breaker, so a dead or hung server cost up to CHEAP_TIMEOUT_MS on each turn before Flash.
+  it('CHEAP_ROUTE=first: a failing local Ollama is skipped after 3 failures, Flash keeps serving', async () => {
+    classifierDist = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    cheapFails = true;
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on', ARGON_TIER: 'off',
+      CHEAP_ROUTE: 'first', CHEAP_BASE_URL: 'http://127.0.0.1:1', CHEAP_MODEL: 'local',
+    });
+    try {
+      for (let i = 0; i < 5; i++) {
+        const r = await request(`${url}/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: `turn ${i}` }] }),
+        });
+        assert.match(String(r.headers['x-jev-route']), /^free;/, `turn ${i} served by Flash`);
+        await r.body.text();
+      }
+      assert.equal(cheapCalls, 3, 'the breaker opened after 3 failures');
+      const health = await (await request(`${url}/healthz`)).body.json() as any;
+      assert.equal(health.cheap?.breaker, 'open');
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
+  it('CHEAP_ROUTE=first: an input the local model cannot translate never opens its breaker', async () => {
+    classifierDist = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on', ARGON_TIER: 'off',
+      CHEAP_ROUTE: 'first', CHEAP_BASE_URL: 'http://127.0.0.1:1', CHEAP_MODEL: 'local',
+    });
+    for (let i = 0; i < 5; i++) cheapQueue.push(() => ({ kind: 'unavailable', reason: 'not translatable: user block: image' }));
+    try {
+      for (let i = 0; i < 5; i++) {
+        const r = await request(`${url}/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: `turn ${i}` }] }),
+        });
+        await r.body.text();
+      }
+      assert.equal(cheapCalls, 5, 'every turn still tried the local model');
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
   // The Argon hop runs through the same `agy` as Flash: when Flash timed out or lost the network,
   // history shows Argon never rescued the turn and cost up to 180 s more before Claude answered.
   describe('Argon after a Flash failure', () => {
