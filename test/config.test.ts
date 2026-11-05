@@ -92,6 +92,7 @@ describe('Ollama / cheap keys ignored if present', () => {
       CHEAP_MODEL: 'gpt-oss:20b-cloud',
     });
     assert.deepEqual(config.cheap, {
+      position: 'fallback',
       baseUrl: 'http://127.0.0.1:11434/v1',
       apiKey: 'ollama',
       model: 'gpt-oss:20b-cloud',
@@ -101,7 +102,29 @@ describe('Ollama / cheap keys ignored if present', () => {
   });
 
   it('CHEAP_ROUTE=fallback without the companion vars fails loudly', () => {
-    assert.throws(() => loadConfig({ ...base, CHEAP_ROUTE: 'fallback' }));
+    assert.throws(() => loadConfig({ ...base, CHEAP_ROUTE: 'fallback' }), /required when CHEAP_ROUTE is fallback or first/);
+  });
+
+  it('CHEAP_ROUTE=first wires a local Ollama provider used before Gemini Flash', () => {
+    const config = loadConfig({
+      ...base,
+      CHEAP_ROUTE: 'first',
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_API_KEY: 'ollama',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+    });
+    assert.deepEqual(config.cheap, {
+      position: 'first',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+      model: 'gpt-oss:20b-cloud',
+      maxOutputTokens: 8_192,
+      timeoutMs: 60_000,
+    });
+  });
+
+  it('CHEAP_ROUTE=first without the companion vars fails loudly', () => {
+    assert.throws(() => loadConfig({ ...base, CHEAP_ROUTE: 'first' }), /required when CHEAP_ROUTE is fallback or first/);
   });
 });
 
