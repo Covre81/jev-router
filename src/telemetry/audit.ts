@@ -18,6 +18,8 @@ export interface ExchangeContext {
   readonly effort?: string | undefined;
   /** Size of `body.tools`: a cheap answer that used none of them is an inspection miss. */
   readonly toolsOffered: number;
+  /** The user's reaction to the previous turn, read from this request (see `reactionOf`). */
+  readonly reaction?: { toolErrors: number; interrupted: boolean } | undefined;
   /** Binding Claude quota window when the exchange was routed. */
   readonly quotaUtilization?: number | undefined;
   readonly diagnostics?: {
@@ -263,5 +265,7 @@ function record(
     upstreamStatus: ctx.upstream?.status ?? null,
     upstreamRatelimitHeaders: ctx.upstream?.rateLimitHeaders ?? null,
     upstreamFailure: ctx.upstream?.failure ?? null,
+    prevToolErrors: ctx.reaction?.toolErrors ?? null,
+    prevInterrupted: ctx.reaction?.interrupted ?? null,
   });
 }

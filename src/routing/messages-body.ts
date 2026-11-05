@@ -86,6 +86,26 @@ export function lastHumanText(body: MessagesBody): string | undefined {
   return undefined;
 }
 
+const INTERRUPTED = /^\[Request interrupted by user/;
+
+/**
+ * How the user reacted to the previous assistant turn, read from the latest user message:
+ * `tool_result` blocks flagged `is_error`, and Claude Code's "[Request interrupted by user…]"
+ * text block. Recorded on the NEW row, so no already-written row has to be updated.
+ */
+export function reactionOf(body: MessagesBody): { toolErrors: number; interrupted: boolean } {
+  const last = turns(body).at(-1);
+  if (!last || last.role !== 'user') return { toolErrors: 0, interrupted: false };
+  if (typeof last.content === 'string') return { toolErrors: 0, interrupted: INTERRUPTED.test(last.content.trim()) };
+  let toolErrors = 0;
+  let interrupted = false;
+  for (const b of last.content) {
+    if (b.type === 'tool_result' && b['is_error'] === true) toolErrors++;
+    if (b.type === 'text' && typeof b['text'] === 'string' && INTERRUPTED.test(b['text'].trim())) interrupted = true;
+  }
+  return { toolErrors, interrupted };
+}
+
 export function isFreshConversation(body: MessagesBody): boolean {
   return turns(body).length === 1;
 }

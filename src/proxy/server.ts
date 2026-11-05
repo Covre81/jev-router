@@ -18,7 +18,7 @@ import type { Provider, ProviderRequest, ProviderResult } from '../providers/pro
 import type { QuotaStore } from '../quota.js';
 import { ModelQuotaState, QUOTA_DEFAULT_COOLDOWN_MS } from '../providers/quota-state.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
-import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, type MessagesBody } from '../routing/messages-body.js';
+import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, reactionOf, type MessagesBody } from '../routing/messages-body.js';
 import { withPrimaryProfile } from '../routing/primary-profile.js';
 import type { RouteDecision, RouteReason, Router } from '../routing/router.js';
 import { auditExchange, auditFailure, type ExchangeContext } from '../telemetry/audit.js';
@@ -351,6 +351,7 @@ export function buildServer({
           effortOverride ??
           (route === 'primary' ? (base.body!['output_config'] as { effort?: string } | undefined)?.effort : undefined),
         toolsOffered: Array.isArray(base.body!['tools']) ? base.body!['tools'].length : 0,
+        reaction: reactionOf(base.body!),
         quotaUtilization: quota?.current()?.utilization,
         diagnostics,
         upstream: upstreamFailureState,

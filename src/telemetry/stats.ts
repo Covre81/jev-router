@@ -51,6 +51,11 @@ export interface RouterStats {
   readonly cursorFallbacks: number;
   /** Turns the local Ollama fallback failed (empty answer, timeout…); the cascade served them elsewhere. */
   readonly cheapLocalFailures: number;
+  /**
+   * What the user did right after a turn, by the provider that served it: follow-up turns, tool
+   * errors and interruptions. Rows from before the migration carry no reaction and are left out.
+   */
+  readonly reactions: readonly { provider: string; followups: number; toolErrors: number; interrupted: number }[];
   /** Anthropic answered 429/529 and the cascade served the turn on Cursor or Flash. */
   readonly primaryRateLimitedFailovers: number;
 }
@@ -139,6 +144,17 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     `SELECT coalesce(sum(inspection_miss), 0) AS n FROM router_logs ${inWindow} AND human_prompt_hash IS NOT NULL`,
   ).n;
 
+  // The reaction is stored on the NEXT row of the session, so the provider it judges is the previous row's.
+  const reactions = all<{ provider: string; followups: number; toolErrors: number; interrupted: number }>(`
+    SELECT prev_provider AS provider, count(*) AS followups, sum(prev_tool_errors > 0) AS toolErrors,
+      sum(prev_interrupted) AS interrupted
+    FROM (
+      SELECT prev_tool_errors, prev_interrupted,
+        lag(final_provider) OVER (PARTITION BY session_id ORDER BY id) AS prev_provider
+      FROM router_logs ${inWindow} AND session_id IS NOT NULL
+    ) WHERE prev_tool_errors IS NOT NULL AND prev_provider IS NOT NULL
+    GROUP BY prev_provider ORDER BY prev_provider`).map((r) => ({ ...r }));
+
   const repeats = all<{ sends: number }>(`
     SELECT count(*) AS sends FROM router_logs ${inWindow} AND human_prompt_hash IS NOT NULL
     GROUP BY human_prompt_hash HAVING count(*) > 1`);
@@ -177,6 +193,7 @@ export function computeStats(db: TelemetryDb, options: StatsOptions = {}): Route
     geminiSkipped: summary.geminiSkipped,
     cursorFallbacks: summary.cursorFallbacks,
     cheapLocalFailures: summary.cheapLocalFailures,
+    reactions,
     primaryRateLimitedFailovers: summary.primaryRateLimitedFailovers,
   };
 }
@@ -264,6 +281,17 @@ export function renderStats(s: RouterStats): string {
   const c = s.cost;
   const money = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(4)}`;
   const verdict = c.netUsd >= 0 ? 'PROFIT' : 'LOSS';
+  const reactions =
+    s.reactions.length > 0
+      ? [
+          'Follow-up turns after a tool error or interruption (by provider that served the previous turn)',
+          table([
+            ['Served by', 'Follow-ups', 'With tool error', 'Interrupted'],
+            ...s.reactions.map((r) => [r.provider, fmt(r.followups), fmt(r.toolErrors), fmt(r.interrupted)]),
+          ]),
+        ].join('\n')
+      : undefined;
+
   const costs = table([
     ['Net cost (USD, API list prices)', ''],
     ['All-Anthropic baseline (warm cache)', money(c.baselineUsd)],
@@ -291,6 +319,7 @@ export function renderStats(s: RouterStats): string {
     '',
     providers,
     ...(models ? ['', models] : []),
+    ...(reactions ? ['', reactions] : []),
     '',
     costs,
     ...(warnings.length > 0 ? ['', ...warnings] : []),

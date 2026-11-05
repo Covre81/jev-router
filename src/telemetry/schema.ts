@@ -95,6 +95,10 @@ export interface RouterLog {
   readonly upstreamStatus?: number | null;
   readonly upstreamRatelimitHeaders?: string | null;
   readonly upstreamFailure?: string | null;
+  /** `is_error` tool results in the user message that opened this exchange: they judge the PREVIOUS turn. */
+  readonly prevToolErrors?: number | null;
+  /** That message was Claude Code's "[Request interrupted by user…]". */
+  readonly prevInterrupted?: boolean | null;
 }
 
 export type NewRouterLog = Pick<RouterLog, 'createdAt' | 'finalProvider' | 'routeReason' | 'outcome' | 'latencyMs'> &
@@ -185,6 +189,9 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE router_logs ADD upstream_status integer;
   ALTER TABLE router_logs ADD upstream_ratelimit_headers text;
   ALTER TABLE router_logs ADD upstream_failure text;`,
+  // The user's reaction to the previous turn travels on the next row of the session.
+  `ALTER TABLE router_logs ADD prev_tool_errors integer;
+  ALTER TABLE router_logs ADD prev_interrupted integer;`,
 ];
 
 /**
@@ -210,14 +217,14 @@ export const INSERT_ROUTER_LOG = `INSERT INTO router_logs (
   fallback_triggered, tools_offered, tool_calls, inspection_miss, quota_utilization,
   cc_session_id, agent_type, prompt_id, compaction, system_hash, tools_hash, system_chars, tools_chars,
   max_tokens, thinking_type, thinking_budget, effort, cache_write_5m_tokens, cache_write_1h_tokens,
-  upstream_status, upstream_ratelimit_headers, upstream_failure
+  upstream_status, upstream_ratelimit_headers, upstream_failure, prev_tool_errors, prev_interrupted
 ) VALUES (
   @createdAt, @sessionId, @humanPromptHash, @jevDecision, @finalProvider, @model, @requestedModel, @routeReason,
   @requestClass, @httpStatus, @outcome, @tokensIn, @tokensOut, @cacheReadTokens, @cacheWriteTokens, @latencyMs,
   @fallbackTriggered, @toolsOffered, @toolCalls, @inspectionMiss, @quotaUtilization,
   @ccSessionId, @agentType, @promptId, @compaction, @systemHash, @toolsHash, @systemChars, @toolsChars,
   @maxTokens, @thinkingType, @thinkingBudget, @effort, @cacheWrite5mTokens, @cacheWrite1hTokens,
-  @upstreamStatus, @upstreamRatelimitHeaders, @upstreamFailure
+  @upstreamStatus, @upstreamRatelimitHeaders, @upstreamFailure, @prevToolErrors, @prevInterrupted
 )`;
 
 /** Named parameters for INSERT_ROUTER_LOG: dates as epoch ms, JSON as text, booleans as 0/1. */
@@ -260,4 +267,6 @@ export const insertParams = (r: NewRouterLog) => ({
   upstreamStatus: r.upstreamStatus ?? null,
   upstreamRatelimitHeaders: r.upstreamRatelimitHeaders ?? null,
   upstreamFailure: r.upstreamFailure ?? null,
+  prevToolErrors: r.prevToolErrors ?? null,
+  prevInterrupted: r.prevInterrupted == null ? null : r.prevInterrupted ? 1 : 0,
 });
