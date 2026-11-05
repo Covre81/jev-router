@@ -814,6 +814,15 @@ export function buildServer({
     }
 
     if (decision.route === 'free') {
+      if (providers.cheap && config.cheap?.position === 'first') {
+        const cheapAttempt = await tryCheap(activeBase);
+        if (cheapAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'free');
+          const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'free', reason: 'cheap:local-first' };
+          return safeRelay(cheapAttempt.result, routeDec, exchange('cheap', config.cheap?.model));
+        }
+      }
+
       // Flash eligibility (tool_choice, image, document) is decided once, in Router.decideTier.
       const flashRes = await tryFlash(activeBase);
       if (flashRes.kind === 'response') {
@@ -879,7 +888,7 @@ export function buildServer({
         }
       }
 
-      if (providers.cheap) {
+      if (providers.cheap && config.cheap?.position === 'fallback') {
         const cheapAttempt = await tryCheap(activeBase);
         if (cheapAttempt.kind === 'response') {
           router.markFallbackLoop(decision, 'free');

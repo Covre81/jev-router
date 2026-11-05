@@ -174,7 +174,7 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
       primary: config.primary.baseUrl,
       argon: config.argon.enabled ? config.argon.modelMedium : 'off',
       cursor: config.cursor ? config.cursor.model : 'off',
-      cheap: config.cheap ? `${config.cheap.model} (fallback)` : 'off',
+      cheap: config.cheap ? `${config.cheap.model} (${config.cheap.position})` : 'off',
       telemetry: config.telemetry.dbPath ?? 'disabled',
     },
     'jev-router ready',

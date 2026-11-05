@@ -54,6 +54,7 @@ export type RouteReason =
   | 'skipped:cursor-busy'
   | 'free:flash'
   | 'cheap:local-fallback'
+  | 'cheap:local-first'
   | 'argon:low'
   | 'argon:medium'
   | 'argon:high'
