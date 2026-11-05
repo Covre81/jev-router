@@ -169,7 +169,7 @@ The router can optionally divert medium-to-hard, text-only turns to Gemini using
 
 ### Failover cascade (Cursor tier)
 
-When Claude answers 429/529 (e.g. the 5-hour session limit), the turn is retried down a cascade instead of dying: **Claude → Cursor → Gemini → cheap**, and only when every tier is down does the original Anthropic error reach the client verbatim. Each failure advances one step; whichever tier serves keeps the tool loop — tool-result continuations stick to that tier without hitting Claude first, a failure there advances to the next tier, and a new human turn stays on the fallback tier only while the binding 5h quota window has not yet reset (after the reset, Claude is retried and a fresh 429 re-enters the cascade). Session-start quota probes (`max_tokens <= 1`) are never rerouted. Turns with images, documents or a forced `tool_choice` skip the CLI tiers straight to cheap.
+When Claude answers 429/529 (e.g. the 5-hour session limit), the turn is retried down a cascade instead of dying: **Claude → Cursor → Gemini → cheap**, and only when every tier is down does the original Anthropic error reach the client verbatim. Each failure advances one step; whichever tier serves keeps the tool loop — tool-result continuations stick to that tier without hitting Claude first, a failure there advances to the next tier, and a new human turn stays on the fallback tier only while the binding 5h quota window has not yet reset (after the reset, Claude is retried and a fresh 429 re-enters the cascade). Session-start quota probes (`max_tokens <= 1`) are never rerouted. A 429/529 that carries `retry-after` of up to 10 s is first waited out and **retried on Claude once** (a retry keeps the prompt cache; a tier change pays a cache miss); a 429 without the header (spend limit) or with a longer wait goes straight down the cascade, and a client that leaves during the wait starts nothing. Separately, on the Gemini path **Argon is skipped** when Flash failed on a timeout or the network, since both run through the same `agy` process; the turn goes to Claude. Turns with images, documents or a forced `tool_choice` skip the CLI tiers straight to cheap.
 
 The Cursor tier is **failover-only** (it is not part of normal JEV routing) and **off by default**. It runs the Cursor CLI (`agent -p --mode ask --trust --output-format stream-json`) as a child process on the user's subscription login. Safety mirrors the Gemini tier: ask mode is read-only but not tool-free, so any `tool_call` started event kills the process tree and counts as a routing miss (`tool attempt: …`); the prompt instructs the model to emit `<jev_tool_use>` blocks for the client tools instead of using its own. The Windows command-line cap limits the rendered prompt to `CURSOR_TIER_MAX_PROMPT_CHARS` (default 24000) — over-budget turns skip Cursor without spawning.
 
@@ -197,6 +197,7 @@ src/
 │   ├── jev-classifier.ts          # TypeSafe /v1/systemone adapter
 │   └── heuristic-classifier.ts    # offline mock for dev/tests
 ├── routing/                       # decides; never talks to a provider
+│   ├── bandit.ts                  # LinUCB for the cheap route; replay only, not wired into routing
 │   ├── messages-body.ts           # open-schema parsing of the Anthropic body
 │   ├── router.ts                  # stickiness, escalation, context budget, fail-to-primary
 │   └── session-store.ts           # TTL + LRU map
@@ -530,6 +531,7 @@ Every `/v1/messages` exchange is written to `~/.jev-router/telemetry.db`
 | `fallback_triggered` | The cheap provider failed before answering and Anthropic served the request |
 | `outcome` | `ok`, `http_error`, `stream_error`, `client_abort` or `proxy_error` |
 | `upstream_status`, `upstream_ratelimit_headers`, `upstream_failure` | Status, Anthropic rate-limit header names, and failure reason from the upstream provider |
+| `prev_tool_errors`, `prev_interrupted` | The user's reaction to the **previous** turn of the session, read from this request: `is_error` tool results and Claude Code's `[Request interrupted by user…]`. `stats` joins them to the provider that served the previous turn (`LAG()` over the session). `upstream_failure = 'retry-after:ok'` marks a 429 cleared by the single retry |
 
 **Why it adds no latency.** The response body passes through a tap that
 copies nothing and only scans `data:` lines that mention `usage` or `error`.
