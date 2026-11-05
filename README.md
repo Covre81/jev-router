@@ -181,6 +181,7 @@ The Cursor tier is **failover-only** (it is not part of normal JEV routing) and 
 src/
 ├── cli.ts                         # `jev-router` binary: serve | reload | stats | statusline | context | agent-hook | help; env-file loading
 ├── serve.ts                       # composition root (only file that knows concrete classes)
+├── shutdown-report.ts             # stop-signal forensics: log at once, inspect recent processes, redact secrets
 ├── supervisor.ts                  # reverse proxy over a forked worker: reload without dropping sessions
 ├── build-info.ts                  # dist/build-info.json (sha + build time) for /healthz and the status line
 ├── quota.ts                       # anthropic-ratelimit-* headers → binding quota window and level
