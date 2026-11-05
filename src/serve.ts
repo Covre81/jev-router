@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import { runningBuild } from './build-info.js';
 import type { ComplexityClassifier } from './classifier/classifier.js';
@@ -21,6 +22,73 @@ import { CursorCliProvider } from './providers/cursor/provider.js';
 import { OpenAICompatibleProvider } from './providers/openai/provider.js';
 import { CircuitBreaker } from './providers/breaker.js';
 import { ModelQuotaState } from './providers/quota-state.js';
+
+const SECRET_FLAG = /((?:api[_-]?key|token|secret|password|passwd|authorization)(?:\s*[=:]\s*|\s+))(?:bearer\s+)?\S+/gi;
+const TOKEN_LIKE = /\b(?:sk-[A-Za-z0-9_-]{8,}|[A-Za-z0-9_-]{32,})\b/g;
+
+/** Command lines go to router.log: mask anything that looks like a credential, then truncate. */
+export function redactCommandLine(cmd: string): string {
+  return cmd.replace(SECRET_FLAG, '$1<REDACTED>').replace(TOKEN_LIKE, '<REDACTED>').slice(0, 240);
+}
+
+/** The parent and every process started in the last 2 minutes, as JSON (Windows only). */
+function inspectWindowsProcesses(): Promise<string> {
+  const script =
+    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${process.ppid}' | Select-Object ProcessId,ParentProcessId,Name,CommandLine; ` +
+    `$since = (Get-Date).AddSeconds(-120); ` +
+    `$r = @(Get-CimInstance Win32_Process | Where-Object { $_.CreationDate -gt $since } | ` +
+    `Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={$_.CreationDate.ToString('o')}}); ` +
+    `@{ parent = $p; recent = $r } | ConvertTo-Json -Compress -Depth 3`;
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 4_000 }, (err, stdout) =>
+      err ? reject(err) : resolve(stdout),
+    );
+  });
+}
+
+interface ProcessInfo { CommandLine?: string | null; [key: string]: unknown }
+
+/**
+ * What to log when the router is asked to stop. Windows does not tell a process who raised a
+ * console Ctrl+C, so the parent (the scheduled task's cmd.exe, normally) is only context: the
+ * sender, if it is a fresh process, is in `recent`. Never throws and never waits past `timeoutMs`.
+ */
+export async function shutdownSignalReport(
+  signal: string,
+  { inspect = inspectWindowsProcesses, platform = process.platform, timeoutMs = 5_000 }: {
+    inspect?: () => Promise<string>;
+    platform?: NodeJS.Platform;
+    timeoutMs?: number;
+  } = {},
+): Promise<Record<string, unknown>> {
+  // No `pid`: every log line already carries it.
+  const base = { signal, at: new Date().toISOString(), ppid: process.ppid };
+  if (platform !== 'win32') return base;
+  try {
+    let timer: NodeJS.Timeout | undefined;
+    const raw = await Promise.race([
+      inspect(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('inspect timeout')), timeoutMs); }),
+    ]).finally(() => clearTimeout(timer));
+    const info = JSON.parse(raw) as { parent?: ProcessInfo | null; recent?: ProcessInfo[] | ProcessInfo | null };
+    const clean = (p: ProcessInfo): ProcessInfo => ({ ...p, CommandLine: p.CommandLine ? redactCommandLine(p.CommandLine) : p.CommandLine ?? null });
+    const recent = info.recent == null ? [] : Array.isArray(info.recent) ? info.recent : [info.recent];
+    return { ...base, parent: info.parent ? clean(info.parent) : null, recent: recent.map(clean) };
+  } catch (err) {
+    return { ...base, inspectError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Logs who/what was around, then runs `stop`. One shot per signal, like the handlers it replaces. */
+function onStopSignal(log: (entry: Record<string, unknown>) => void, stop: () => Promise<void>): void {
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) {
+    process.once(signal, () => {
+      void shutdownSignalReport(signal)
+        .then((report) => log(report))
+        .finally(() => void stop().then(() => process.exit(0)));
+    });
+  }
+}
 
 const SESSION_MAX_ENTRIES = 10_000;
 
@@ -182,10 +250,15 @@ export async function serve(config: Config, { worker = false } = {}): Promise<vo
   const stale = removedEnvSet();
   if (stale.length > 0) app.log.warn({ stale }, 'ignored: these env vars were removed, delete them from .env');
 
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(signal, () => {
-      void app.close().then(() => process.exit(0));
-    });
+  if (worker) {
+    // The supervisor logs the signal (it receives the same console Ctrl+C); the worker just stops.
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      process.once(signal, () => {
+        void app.close().then(() => process.exit(0));
+      });
+    }
+  } else {
+    onStopSignal((report) => app.log.warn(report, 'stop signal received'), () => app.close());
   }
 }
 
@@ -197,9 +270,8 @@ export async function supervise(config: Config, forkWorker: () => WorkerProcess)
     drainMs: config.supervisor.drainMs,
     forkWorker,
   });
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(signal, () => {
-      void supervisor.close().then(() => process.exit(0));
-    });
-  }
+  onStopSignal(
+    (report) => console.log(JSON.stringify({ level: 40, time: Date.now(), pid: process.pid, name: 'supervisor', msg: 'stop signal received', ...report })),
+    () => supervisor.close(),
+  );
 }
