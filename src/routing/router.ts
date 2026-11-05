@@ -327,7 +327,7 @@ export class Router {
       // Single owner of Flash eligibility: the server trusts route 'free' and never re-checks.
       const ineligibleForFlash = !escalatedByContext && tierRoute(tier) === 'free' && hasImageDocumentOrToolChoice(ctx.body);
       const final: Tier = escalatedByContext || ineligibleForFlash ? 'primary' : tier;
-      this.sessions.set(key, final);
+      this.sessions.set(key, ineligibleForFlash ? tier : final);
       if (final === 'gemini' || final === 'free') this.lastRouteWasGemini.add(key);
       else this.lastRouteWasGemini.delete(key);
       return stampTransition({

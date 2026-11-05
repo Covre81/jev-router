@@ -856,15 +856,6 @@ export function buildServer({
         return relayClaude(base, routeDec);
       }
 
-      if (providers.cheap) {
-        const cheapAttempt = await tryCheap(activeBase);
-        if (cheapAttempt.kind === 'response') {
-          router.markFallbackLoop(decision, 'free');
-          const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'free', reason: 'cheap:local-fallback', substitutedFrom: flashModel };
-          return safeRelay(cheapAttempt.result, routeDec, exchange('cheap', config.cheap?.model));
-        }
-      }
-
       const flashFailureReason = flashRes.reason;
       let argonFailed = false;
       if (config.argon.enabled && flashRes.kind !== 'skipped') {
@@ -885,6 +876,15 @@ export function buildServer({
           }
           argonFailed = true;
           curProfile = bumpArgonProfile(curProfile);
+        }
+      }
+
+      if (providers.cheap) {
+        const cheapAttempt = await tryCheap(activeBase);
+        if (cheapAttempt.kind === 'response') {
+          router.markFallbackLoop(decision, 'free');
+          const routeDec: RouteDecision = { ...decision, route: 'cheap', tier: 'free', reason: 'cheap:local-fallback', substitutedFrom: flashModel };
+          return safeRelay(cheapAttempt.result, routeDec, exchange('cheap', config.cheap?.model));
         }
       }
 
