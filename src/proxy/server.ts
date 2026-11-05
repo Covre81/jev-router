@@ -18,6 +18,7 @@ import type { Provider, ProviderRequest, ProviderResult } from '../providers/pro
 import type { QuotaStore } from '../quota.js';
 import { ModelQuotaState, QUOTA_DEFAULT_COOLDOWN_MS } from '../providers/quota-state.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
+import { CircuitBreaker } from '../providers/breaker.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, reactionOf, type MessagesBody } from '../routing/messages-body.js';
 import { withPrimaryProfile } from '../routing/primary-profile.js';
@@ -43,6 +44,8 @@ export interface ServerDeps {
   readonly geminiBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly argonBreaker?: import('../providers/breaker.js').CircuitBreaker;
   readonly cursorBreaker?: import('../providers/breaker.js').CircuitBreaker;
+  /** Breaker for the local Ollama; built from CHEAP_BREAKER_* defaults when omitted. */
+  readonly cheapBreaker?: import('../providers/breaker.js').CircuitBreaker;
   /** Log destination override (tests capture hop logs); default is stdout. */
   readonly logStream?: NodeJS.WritableStream;
   readonly timeouts?: {
@@ -179,9 +182,13 @@ export function buildServer({
   geminiBreaker,
   argonBreaker,
   cursorBreaker,
+  cheapBreaker: cheapBreakerOption,
   logStream,
   timeouts,
 }: ServerDeps): FastifyInstance {
+  // ponytail: same defaults as the Gemini breaker (3 failures, 5 min, one call at a time); env knobs when needed.
+  // A dead or hung local Ollama then costs at most 3 timeouts instead of one per free turn.
+  const cheapBreaker = cheapBreakerOption ?? (providers.cheap ? new CircuitBreaker(3, 300_000, 1) : undefined);
   const startedAt = new Date().toISOString();
 
   const app = Fastify({
@@ -256,6 +263,7 @@ export function buildServer({
       gemini: config.gemini ? { model: config.gemini.model, breaker: geminiBreaker?.state, inFlight: geminiBreaker?.inFlight } : null,
       argon: config.argon.enabled ? { breaker: argonBreaker?.state, inFlight: argonBreaker?.inFlight } : null,
       cursor: config.cursor ? { model: config.cursor.model, breaker: cursorBreaker?.state, inFlight: cursorBreaker?.inFlight } : null,
+      cheap: config.cheap ? { model: config.cheap.model, position: config.cheap.position, breaker: cheapBreaker?.state, inFlight: cheapBreaker?.inFlight } : null,
       models: quotaState.snapshot(knownModels),
     };
   });
@@ -514,9 +522,11 @@ export function buildServer({
      */
     const tryCheap = async (r: ProviderRequest): Promise<{ kind: 'response'; result: ProviderResult } | { kind: 'failed' }> => {
       const provider = providers.cheap;
-      if (!provider) return { kind: 'failed' };
+      // Open or busy breaker: skip at once (no cheap:* failure recorded, nothing was tried).
+      if (!provider || !cheapBreaker?.acquire()) return { kind: 'failed' };
       const hopStart = performance.now();
       let res: ProviderResult;
+      let outcome: 'success' | 'failure' | 'neutral' = 'failure';
       // The `cheap:` prefix keeps this hop's failure apart from Flash's in upstream_failure;
       // route_reason stays Flash's (it drives Gemini-skip stats and the Claude escalation).
       // ponytail: a later hop that also fails (Argon) overwrites it, last failure wins as for every hop.
@@ -526,12 +536,22 @@ export function buildServer({
         return { kind: 'failed' as const };
       };
       try {
-        res = await provider.send(r);
-      } catch (err) {
-        return failed(err instanceof Error ? err.message : String(err));
+        try {
+          res = await provider.send(r);
+        } catch (err) {
+          if (r.signal.aborted) outcome = 'neutral'; // the client left; the server may be fine
+          return failed(err instanceof Error ? err.message : String(err));
+        }
+        if (res.kind !== 'response') {
+          // An input the local model cannot take (e.g. an image in the history) says nothing about its health.
+          if (res.reason.startsWith('not translatable') || res.reason === 'aborted') outcome = 'neutral';
+          return failed(res.reason);
+        }
+        outcome = 'success';
+        return { kind: 'response', result: res };
+      } finally {
+        cheapBreaker.release(outcome);
       }
-      if (res.kind !== 'response') return failed(res.reason);
-      return { kind: 'response', result: res };
     };
 
     const getArgonModel = (profile: ArgonProfile): string => {
