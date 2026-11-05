@@ -277,6 +277,11 @@ export async function startSupervisor(options: SupervisorOptions): Promise<Super
   };
 }
 
+/** One pino-shaped JSON line on stdout (router.log), like the worker's Fastify logger. */
+export function supervisorLog(msg: string, extra: Record<string, unknown> = {}, level = 30): void {
+  console.log(JSON.stringify({ level, time: Date.now(), pid: process.pid, name: 'supervisor', msg, ...extra }));
+}
+
 function defaultLog(msg: string, extra: Record<string, unknown> = {}): void {
-  console.log(JSON.stringify({ level: 30, time: Date.now(), pid: process.pid, name: 'supervisor', msg, ...extra }));
+  supervisorLog(msg, extra);
 }
