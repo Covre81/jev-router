@@ -18,6 +18,7 @@ import type { Provider, ProviderRequest, ProviderResult } from '../providers/pro
 import type { QuotaStore } from '../quota.js';
 import { ModelQuotaState, QUOTA_DEFAULT_COOLDOWN_MS } from '../providers/quota-state.js';
 import { buildTransitionHandoff, withTransitionHandoff } from '../context/transition-handoff.js';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { hasImageDocumentOrToolChoice, latestHumanText, parseMessagesBody, reactionOf, type MessagesBody } from '../routing/messages-body.js';
 import { withPrimaryProfile } from '../routing/primary-profile.js';
 import type { RouteDecision, RouteReason, Router } from '../routing/router.js';
@@ -53,6 +54,19 @@ export interface ServerDeps {
 
 /** Primary statuses that mean "no quota/capacity right now" (opt-in failover). */
 const PRIMARY_RATE_LIMITED = new Set([429, 529]);
+/** Longest `retry-after` worth waiting out before failing over: the client is blocked meanwhile. */
+const RETRY_AFTER_MAX_MS = 10_000;
+
+/**
+ * How long a 429/529 asks us to wait, when that is short enough to be worth it. A 429 without the
+ * header (the spend-limit one) or with a long wait is not retried.
+ */
+export function retryAfterMs(headers: Readonly<Record<string, string | string[] | undefined>>): number | undefined {
+  const raw = headers['retry-after'];
+  const seconds = Number(Array.isArray(raw) ? raw[0] : raw);
+  const ms = seconds * 1000;
+  return Number.isFinite(ms) && ms > 0 && ms <= RETRY_AFTER_MAX_MS ? ms : undefined;
+}
 
 function anthropicError(type: string, message: string) {
   return { type: 'error', error: { type, message } };
@@ -978,6 +992,25 @@ export function buildServer({
     const errorBody = await collectBodyBuffer(primary.body);
     const skipCli = hasImageDocumentOrToolChoice(base.body!);
     const primaryFailure = { status: primary.status, rateLimitHeaders: quotaHeaderNames.join(',') };
+
+    // Token-bucket 429: wait what Anthropic asked and ask Claude again, once. A retry on Claude keeps
+    // the prompt cache; every tier change below pays a cache miss.
+    const wait = retryAfterMs(primary.headers);
+    if (wait !== undefined) {
+      const clientLeft = await sleep(wait, true, { signal: activeBase.signal }).then(() => false, () => true);
+      if (clientLeft) {
+        // Nobody is listening: do not start the cascade (it would take breaker slots for nothing).
+        return safeRelay({ ...primary, body: Readable.from([errorBody]) }, decision, exchange('primary'));
+      }
+      const again = await sendClaude(activeBase, decision);
+      if (again.result.kind === 'response' && !PRIMARY_RATE_LIMITED.has(again.result.status)) {
+        const ok = again.result.status < 400;
+        req.log.info({ waitedMs: wait, status: again.result.status }, ok ? 'primary 429 cleared after retry-after' : 'primary retry-after retry answered with an error');
+        upstreamFailureState = { ...primaryFailure, failure: ok ? 'retry-after:ok' : 'retry-after:error' };
+        return safeRelay(again.result, again.dec, exchange('primary', again.served?.model, again.served?.effort));
+      }
+      if (again.result.kind === 'response') await collectBodyBuffer(again.result.body); // drain the second 429
+    }
 
     const vetoed = decision.distribution ? hardRiskVeto(decision.distribution) : await router.cascadeRiskVeto(base.body!);
     if (vetoed) {
