@@ -197,6 +197,54 @@ describe('Router decisions', () => {
     assert.notEqual(turn2.reason, 'sticky');
   });
 
+  // Regression (PR #11 review): the ineligible turn stores 'free' so the next HUMAN turn can go back
+  // to Flash, but the tool loop Claude opened on that turn must stay on Claude. Its tool_result
+  // continuation used to fall into sticky 'free' and moved the loop to Gemini/Ollama mid-task.
+  it('ineligible turn served by Claude keeps its own tool loop on Claude, then the next human turn goes free', async () => {
+    const simple = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { router, store } = setupRouter(simple, { geminiFromPrimary: false });
+    const sid = { 'x-claude-code-session-id': 's-ineligible-loop' };
+    store.set('s-ineligible-loop:main', 'free');
+
+    const turn1 = [
+      { role: 'user', content: 'prior context' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: [{ type: 'image' }, { type: 'text', text: 'look at this' }] },
+    ];
+    const d1 = await router.decide(req({ messages: turn1 }, sid) as any);
+    assert.equal(d1.route, 'primary');
+
+    const loop = [
+      ...turn1,
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't9', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't9', content: 'file' }] },
+    ];
+    const d2 = await router.decide(req({ messages: loop }, sid) as any);
+    assert.equal(d2.route, 'primary', 'tool_result continuation of a Claude turn stays on Claude');
+    assert.notEqual(d2.modelTransition, true);
+
+    const human = [...loop, { role: 'assistant', content: 'done' }, { role: 'user', content: 'plain text question' }];
+    const d3 = await router.decide(req({ messages: human }, sid) as any);
+    assert.equal(d3.route, 'free', 'the next human turn returns to the cheap tier');
+  });
+
+  it('a cascade loop does not take back the tool loop of an ineligible turn Claude served', async () => {
+    const simple = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { router } = setupRouter(simple, { geminiFromPrimary: false });
+    const sid = { 'x-claude-code-session-id': 's-loop-image' };
+    const t0 = [{ role: 'user', content: 'hello' }];
+    const d0 = await router.decide(req({ messages: t0 }, sid) as any);
+    router.markFallbackLoop(d0, 'free'); // e.g. Claude 429 -> Flash served the turn
+
+    const t1 = [...t0, { role: 'assistant', content: 'ok' }, { role: 'user', content: [{ type: 'image' }, { type: 'text', text: 'and this?' }] }];
+    const d1 = await router.decide(req({ messages: t1 }, sid) as any);
+    assert.equal(d1.route, 'primary');
+
+    const loop = [...t1, { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1' }] }];
+    const d2 = await router.decide(req({ messages: loop }, sid) as any);
+    assert.equal(d2.route, 'primary', 'the cascade loop must not resume inside the Claude tool loop');
+  });
+
   it('no geminiPolicy + text-only -> primary', async () => {
     const { router } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 }, { noGeminiPolicy: true });
     const dec = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }] }, { 'x-claude-code-session-id': 's14' }) as any);
