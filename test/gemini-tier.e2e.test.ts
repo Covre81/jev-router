@@ -494,4 +494,54 @@ describe('Gemini Tier E2E', () => {
       telemetry.close();
     }
   });
+
+  it('fallback order: Flash fails -> Argon (if enabled and answers) before Cheap; Flash and Argon both fail -> Cheap answers before Claude', async () => {
+    classifierDist = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on',
+      ARGON_TIER: 'on',
+      CHEAP_ROUTE: 'fallback',
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+    });
+    const failing = () => {
+      const fakeChild = new EventEmitter() as any;
+      fakeChild.stdin = new Writable({ write(c, e, cb) { cb(); } });
+      fakeChild.stdout = new EventEmitter();
+      fakeChild.stderr = new EventEmitter();
+      fakeChild.pid = 304;
+      setTimeout(() => fakeChild.emit('close', 1), 2);
+      return fakeChild;
+    };
+    try {
+      // 1. Flash fails and Argon answers: cheap provider must NOT be called
+      spawnQueue.push(failing); // Flash fails; Argon low/high (default fakeSpawnFn) succeeds
+      const r1 = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'test-argon-first' }] }),
+      });
+      assert.equal(r1.statusCode, 200);
+      assert.equal(r1.headers['x-jev-route'], 'argon; reason=escalated:flash-failed');
+      assert.equal(cheapCalls, 0);
+      assert.equal(anthropicHits, 0);
+      await r1.body.text();
+
+      // 2. Flash and Argon both fail: cheap is called and answers before Claude
+      for (let i = 0; i < 5; i++) spawnQueue.push(failing);
+      const r2 = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'test-cheap-after-argon' }] }),
+      });
+      assert.equal(r2.statusCode, 200);
+      assert.equal(r2.headers['x-jev-route'], 'cheap; reason=cheap:local-fallback');
+      assert.equal(cheapCalls, 1);
+      assert.equal(anthropicHits, 0);
+      await r2.body.text();
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
 });

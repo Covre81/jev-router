@@ -171,6 +171,32 @@ describe('Router decisions', () => {
     assert.equal(image.reason, 'gemini:ineligible-input');
   });
 
+  it('free session with image turn routes primary (ineligible-input) but does not stick to primary on next plain text turn', async () => {
+    const simple = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { router, store } = setupRouter(simple, { geminiFromPrimary: false });
+    const sid = { 'x-claude-code-session-id': 's-ineligible-sticky' };
+    store.set('s-ineligible-sticky:main', 'free');
+
+    const turn1Messages = [
+      { role: 'user', content: 'prior context' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: [{ type: 'image' }, { type: 'text', text: 'look at this' }] },
+    ];
+    const turn1 = await router.decide(req({ messages: turn1Messages }, sid) as any);
+    assert.equal(turn1.route, 'primary');
+    assert.equal(turn1.reason, 'gemini:ineligible-input');
+
+    const turn2Messages = [
+      ...turn1Messages,
+      { role: 'assistant', content: 'i see the image' },
+      { role: 'user', content: 'plain text question' },
+    ];
+    const turn2 = await router.decide(req({ messages: turn2Messages }, sid) as any);
+    assert.equal(turn2.route, 'free');
+    assert.equal(turn2.tier, 'free');
+    assert.notEqual(turn2.reason, 'sticky');
+  });
+
   it('no geminiPolicy + text-only -> primary', async () => {
     const { router } = setupRouter({ simple: 0.1, standard: 0.2, structural: 0.7, risk: 0.1, textOnly: 0.95 }, { noGeminiPolicy: true });
     const dec = await router.decide(req({ messages: [{ role: 'user', content: 'hi' }] }, { 'x-claude-code-session-id': 's14' }) as any);
