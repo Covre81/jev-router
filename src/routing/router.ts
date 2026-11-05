@@ -368,9 +368,13 @@ export class Router {
     const humanText = latestHumanText(ctx.body);
     const isProbe = typeof ctx.body.max_tokens === 'number' && ctx.body.max_tokens <= 1;
     if (isProbe) return primary('classified');
+    // A tool_result continues the turn before it: when Claude served that turn (an ineligible input
+    // routed to primary while the session stays 'free' or in a cascade loop), the loop stays on
+    // Claude. Moving it mid-task hands Claude's tool_use to another model and drops the prompt cache.
+    const servedByClaude = this.lastServedTier.get(key) === 'primary';
     const loopTier = this.fallbackLoopTier(key);
     const loopActive =
-      loopTier && !hasImageDocumentOrToolChoice(ctx.body) && !isProbe ? loopTier : undefined;
+      loopTier && !hasImageDocumentOrToolChoice(ctx.body) && !isProbe && !servedByClaude ? loopTier : undefined;
     if (loopActive && humanText === undefined) {
       return stampTransition({
         route: tierRoute(loopActive),
@@ -382,6 +386,7 @@ export class Router {
     }
 
     if (humanText === undefined) {
+      if (servedByClaude && stored !== 'primary') return primary('sticky');
       if (
         (stored === 'free' || stored === 'gemini' || this.lastRouteWasGemini.has(key)) &&
         !hasImageDocumentOrToolChoice(ctx.body)
