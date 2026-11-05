@@ -355,30 +355,33 @@ provider's health (`unknown | up | down`). The build stamps
 > `01f68ad`, `340c797`): Gemini via `agy` replaced it as the default free
 > tier, then Argon/Cursor were added. The health-probe paragraph that used
 > to live here (`cheap-health.ts`, `/models` polling) was removed with it
-> and is not back. What follows (`CHEAP_ROUTE=fallback`) is a new, narrower
-> feature: a local Ollama hop tried once, only after Flash (Gemini) itself
-> reports busy/unhealthy/unavailable for that turn. It never replaces
-> Gemini and is off by default. The rest of this README (the routing-model
+> and is not back. What follows (`CHEAP_ROUTE`) is a new, narrower
+> feature: a local Ollama hop on the free path, either before Flash (`first`,
+> 2026-11-05) or after Flash and Argon (`fallback`). Off by default. The rest of this README (the routing-model
 > ADR above, `/healthz`'s old `cheap` field) still describes the pre-Gemini
 > architecture and hasn't been refreshed — ask for that separately if you
 > want it brought current.**
 
-**Local Ollama fallback (`CHEAP_ROUTE=fallback`).** Off by default
-(`CHEAP_ROUTE=off`). When set, every turn Flash would otherwise have served
-gets one extra try against `CHEAP_BASE_URL` (OpenAI-compatible
-`/chat/completions`) before escalating to Argon/Claude, but only once Flash
-itself failed for that turn (`skipped:gemini-busy`,
-`skipped:gemini-unhealthy`, `failover:gemini-unavailable`) — it is never
-tried instead of Flash, and a turn with an image/document/tool_choice skips
-it the same way it skips Flash. No standing health probe: a bad
-`CHEAP_BASE_URL` just costs one bounded `CHEAP_TIMEOUT_MS` (default 60 s) per
-affected turn before falling through to Argon/Claude, same as any other
-failed hop. Served turns show up with `route: cheap` (`x-jev-route: cheap;
-reason=cheap:local-fallback`) and bill through the existing `cheap`/`openai`
-telemetry columns (`stats`, `CHEAP_PRICE_*_PER_MTOK`).
+**Local Ollama on the free path (`CHEAP_ROUTE=first|fallback`).** Off by default
+(`CHEAP_ROUTE=off`). Either mode sends a turn to `CHEAP_BASE_URL` (OpenAI-compatible
+`/chat/completions`) only when the router already chose the free path for it, so a turn with an
+image/document/forced `tool_choice`, or vetoed as risky, never reaches it.
+
+- `first`: the local Ollama is tried **before** Flash; on failure the turn goes on to Flash →
+  Argon → Claude.
+- `fallback`: tried once, **after** Flash and Argon both failed, right before Claude.
+
+The hop sits behind a circuit breaker with the Gemini defaults (3 failures open it for 5 min, one
+call at a time): open or busy skips it at once, so a dead server costs at most 3
+`CHEAP_TIMEOUT_MS` (default 60 s) waits, not one per turn. An input the local model cannot take
+(e.g. an image left in the history) or a client abort does not count as a failure. `/healthz`
+reports `cheap` with its position and breaker state. Served turns show up with `route: cheap`
+(`x-jev-route: cheap; reason=cheap:local-first` or `cheap:local-fallback`), failures as
+`upstream_failure = 'cheap:<code>'`, and bill through the existing `cheap`/`openai` telemetry
+columns (`stats`, `CHEAP_PRICE_*_PER_MTOK`).
 
 ```bash
-CHEAP_ROUTE=fallback
+CHEAP_ROUTE=first        # or fallback
 CHEAP_BASE_URL=http://<servidor>:11434/v1
 CHEAP_API_KEY=ollama
 CHEAP_MODEL=gpt-oss:20b-cloud
