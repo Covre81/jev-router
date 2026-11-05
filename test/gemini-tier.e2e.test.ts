@@ -37,6 +37,7 @@ describe('Gemini Tier E2E', () => {
   let spawnCalls = 0;
   let spawnQueue: (() => any)[] = [];
   let cheapCalls = 0;
+  let cheapQueue: (() => any)[] = [];
   const DEFAULT_DIST = { simple: 0, standard: 0, structural: 1, risk: 0.1, textOnly: 1.0 };
   let classifierDist: any = DEFAULT_DIST;
 
@@ -65,6 +66,7 @@ describe('Gemini Tier E2E', () => {
     spawnCalls = 0;
     spawnQueue = [];
     cheapCalls = 0;
+    cheapQueue = [];
     classifierDist = DEFAULT_DIST;
   });
 
@@ -104,7 +106,31 @@ describe('Gemini Tier E2E', () => {
     const providers = {
       primary: new AnthropicProvider(config.primary),
       gemini: config.gemini ? new GeminiCliProvider({ ...config.gemini, spawnFn: fakeSpawnFn } as any) : undefined,
-      ...(config.cheap ? { cheap: { send: async () => (cheapCalls++, { kind: 'response', status: 200, headers: {}, body: Readable.from([JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'local ollama ok' }], stop_reason: 'end_turn', usage: {} })]) }) } as any } : {}),
+      ...(config.cheap
+        ? {
+            cheap: {
+              send: async () => {
+                cheapCalls++;
+                const fn = cheapQueue.shift();
+                if (fn) return fn();
+                return {
+                  kind: 'response',
+                  status: 200,
+                  headers: {},
+                  body: Readable.from([
+                    JSON.stringify({
+                      type: 'message',
+                      role: 'assistant',
+                      content: [{ type: 'text', text: 'local ollama ok' }],
+                      stop_reason: 'end_turn',
+                      usage: {},
+                    }),
+                  ]),
+                };
+              },
+            } as any,
+          }
+        : {}),
     };
 
     const router = new Router(classifier as any, store, {
@@ -539,6 +565,80 @@ describe('Gemini Tier E2E', () => {
       assert.equal(cheapCalls, 1);
       assert.equal(anthropicHits, 0);
       await r2.body.text();
+    } finally {
+      await proxy.close();
+      telemetry.close();
+    }
+  });
+
+  it('first order: Cheap runs first; on failure Flash answers; on Flash+Argon failure Claude answers (cheap not retried)', async () => {
+    classifierDist = { simple: 0.95, standard: 0.03, structural: 0.02, risk: 0.05, textOnly: 0.95 };
+    const { proxy, url } = await createTestServer({
+      GEMINI_TIER: 'on',
+      ARGON_TIER: 'on',
+      CHEAP_ROUTE: 'first',
+      CHEAP_BASE_URL: 'http://127.0.0.1:11434/v1',
+      CHEAP_MODEL: 'gpt-oss:20b-cloud',
+    });
+    const failing = () => {
+      const fakeChild = new EventEmitter() as any;
+      fakeChild.stdin = new Writable({ write(c, e, cb) { cb(); } });
+      fakeChild.stdout = new EventEmitter();
+      fakeChild.stderr = new EventEmitter();
+      fakeChild.pid = 304;
+      setTimeout(() => fakeChild.emit('close', 1), 2);
+      return fakeChild;
+    };
+    try {
+      // (a) cheap answers -> header 'cheap; reason=cheap:local-first', Flash spawn not used, anthropicHits 0
+      cheapCalls = 0;
+      spawnCalls = 0;
+      anthropicHits = 0;
+      const r1 = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'test-cheap-first' }] }),
+      });
+      assert.equal(r1.statusCode, 200);
+      assert.equal(r1.headers['x-jev-route'], 'cheap; reason=cheap:local-first');
+      assert.equal(cheapCalls, 1);
+      assert.equal(spawnCalls, 0);
+      assert.equal(anthropicHits, 0);
+      await r1.body.text();
+
+      // (b) cheap fails (make cheap mock fail/return 500) -> Flash answers -> header route free, cheapCalls 1
+      cheapCalls = 0;
+      spawnCalls = 0;
+      anthropicHits = 0;
+      cheapQueue.push(() => ({ kind: 'unavailable', reason: 'HTTP 500' }));
+      const r2 = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'test-cheap-fail-flash-ok' }] }),
+      });
+      assert.equal(r2.statusCode, 200);
+      assert.ok(String(r2.headers['x-jev-route']).startsWith('free;'));
+      assert.equal(cheapCalls, 1);
+      assert.equal(spawnCalls, 1);
+      assert.equal(anthropicHits, 0);
+      await r2.body.text();
+
+      // (c) cheap fails and Flash and Argon fail -> Claude answers, cheapCalls exactly 1 (not retried)
+      cheapCalls = 0;
+      spawnCalls = 0;
+      anthropicHits = 0;
+      cheapQueue.push(() => ({ kind: 'unavailable', reason: 'HTTP 500' }));
+      for (let i = 0; i < 5; i++) spawnQueue.push(failing);
+      const r3 = await request(`${url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: 'test-cheap-fail-argon-fail-claude' }] }),
+      });
+      assert.equal(r3.statusCode, 200);
+      assert.ok(String(r3.headers['x-jev-route']).startsWith('primary;'));
+      assert.equal(cheapCalls, 1);
+      assert.equal(anthropicHits, 1);
+      await r3.body.text();
     } finally {
       await proxy.close();
       telemetry.close();
