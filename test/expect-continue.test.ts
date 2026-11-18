@@ -89,15 +89,22 @@ describe('expect: 100-continue and wedged pool fixes', () => {
       assert.ok(duration < 1000, `duration ${duration} ms should be around 200ms`);
 
       const fake = await fakeServer(() => anthropicOk, []);
-      const provider2 = new AnthropicProvider({
-        baseUrl: fake.url,
-        timeoutMs: 200,
-        authMode: 'passthrough',
-        apiKey: undefined,
-      });
-      const res2 = await provider2.send({ method: 'POST', url: '/v1/messages', headers: {}, signal: new AbortController().signal, rawBody: undefined, body: undefined });
-      assert.equal(res2.kind, 'response', res2.kind === 'unavailable' ? res2.reason : '');
-      fake.server.close();
+      try {
+        // This is the process's first real undici connection: undici compiles its llhttp WASM
+        // parser synchronously on it (~170-225 ms on a Core i3), so a 200 ms deadline here flaked.
+        // Recovery is the claim, not speed: give the healthy upstream a generous deadline.
+        const provider2 = new AnthropicProvider({
+          baseUrl: fake.url,
+          timeoutMs: 5_000,
+          authMode: 'passthrough',
+          apiKey: undefined,
+        });
+        const res2 = await provider2.send({ method: 'POST', url: '/v1/messages', headers: {}, signal: new AbortController().signal, rawBody: undefined, body: undefined });
+        assert.equal(res2.kind, 'response', res2.kind === 'unavailable' ? res2.reason : '');
+      } finally {
+        // An assertion failure above must not leave the server listening: that hung the whole file.
+        fake.server.close();
+      }
     });
   });
 
