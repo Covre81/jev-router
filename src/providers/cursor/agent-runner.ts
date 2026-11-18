@@ -125,6 +125,7 @@ export async function runCursorAgent(
     let aggregateText = '';
     let finalResult: any;
     let firstByteReceived = false;
+    let promptRead = false;
 
     return await new Promise<CursorResult>((resolve) => {
       let firstByteTimer: NodeJS.Timeout | undefined;
@@ -166,7 +167,14 @@ export async function runCursorAgent(
         if (!ev || typeof ev !== 'object') return;
         if (isToolStarted(ev)) {
           // The prompt is delivered as workspace/prompt.md (argv is capped on Windows): reading it is expected.
-          if (isPromptFileRead(ev) || isHarmlessCursorTool(ev)) return;
+          if (isPromptFileRead(ev)) {
+            // The task is in prompt.md: anything said before reading it is narration, not the answer.
+            promptRead = true;
+            segmentText = '';
+            aggregateText = '';
+            return;
+          }
+          if (isHarmlessCursorTool(ev)) return;
           toolAttempted = toolKind(ev);
           if (child.pid !== undefined) killTree(child.pid);
           return;
@@ -234,7 +242,9 @@ export async function runCursorAgent(
           const detail = resultStr ? `: ${resultStr.slice(0, 200)}` : '';
           return settle({ ok: false, reason: `result error${detail}` });
         }
-        const text = (typeof finalResult.result === 'string' && finalResult.result.trim() ? finalResult.result : segmentText || aggregateText).trim();
+        // Cursor's `result` glues pre-read narration to the answer; after a prompt.md read, trust the post-read text.
+        const postRead = promptRead ? (segmentText || aggregateText).trim() : '';
+        const text = (postRead || (typeof finalResult.result === 'string' && finalResult.result.trim() ? finalResult.result : segmentText || aggregateText)).trim();
         if (!text) return settle({ ok: false, reason: 'empty' });
 
         settle({
