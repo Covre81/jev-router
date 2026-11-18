@@ -1,7 +1,7 @@
 {
   "name": "jev-router",
   "version": "0.1.0",
-  "description": "Local Anthropic-compatible gateway that uses TypeSafe JEV (System One) to send simple Claude Code work to a cheap OpenAI-compatible provider and keep the Claude quota for heavy lifting.",
+  "description": "Local Anthropic-compatible gateway that uses TypeSafe JEV (System One) to route Claude Code turns to Gemini (agy) and Cursor subscriptions and keep the Claude quota for risky and structural work.",
   "private": true,
   "type": "module",
   "license": "MIT",
