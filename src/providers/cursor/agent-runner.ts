@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { parseQuotaError } from '../quota-state.js';
 
 export interface CursorRunnerOptions {
-  /** Cursor agent root: `%LOCALAPPDATA%\cursor-agent` (holds `versions\<date>\node.exe` + `index.js`). */
+  /** Cursor agent root: `%LOCALAPPDATA%\cursor-agent` or `~/.local/share/cursor-agent` (holds `versions/<date>/node[.exe]` + `index.js`). */
   readonly bin: string;
   readonly model: string;
   readonly timeoutMs: number;
@@ -32,9 +32,11 @@ export function resolveCursorLaunch(binRoot: string): { nodeExe: string; indexJs
       .sort()
       .reverse();
     for (const name of candidates) {
-      const nodeExe = join(versionsDir, name, 'node.exe');
       const indexJs = join(versionsDir, name, 'index.js');
-      if (existsSync(nodeExe) && existsSync(indexJs)) return { nodeExe, indexJs };
+      if (!existsSync(indexJs)) continue;
+      // Windows ships node.exe, Linux ships node; an install has only one of them.
+      const nodeExe = ['node.exe', 'node'].map((n) => join(versionsDir, name, n)).find((p) => existsSync(p));
+      if (nodeExe) return { nodeExe, indexJs };
     }
   } catch {
     // missing layout: unavailable, never crash

@@ -187,7 +187,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
 
   const cursorBin = e.CURSOR_TIER_BIN
     ? expandEnv(e.CURSOR_TIER_BIN, env)
-    : join(env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'cursor-agent');
+    : process.platform === 'win32'
+      ? join(env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'cursor-agent')
+      : join(homedir(), '.local', 'share', 'cursor-agent'); // where the Linux installer puts it
 
   return {
     host: e.HOST,
